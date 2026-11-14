@@ -1,0 +1,39 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local test and editor artifacts
+.test-tmp/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# NASA FIRMS source downloads and training data
+DL_FIRE_*/
+Nasa training data/
+*.zip
+*.csv
+
+# Generated databases, point data, aggregates, spatial products, and manifests
+data/
+*.duckdb
+*.parquet
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/

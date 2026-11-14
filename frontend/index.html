@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Interactive demonstration of real NASA FIRMS hotspot observations." />
+    <title>FIRMS Fire Activity Explorer</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div>
+        <p class="eyebrow">NASA FIRMS · real observations</p>
+        <h1>Fire Activity Explorer</h1>
+      </div>
+      <div class="status" id="api-status"><span></span> Connecting to data</div>
+    </header>
+
+    <main>
+      <section class="intro card">
+        <div>
+          <h2>Explore satellite-detected thermal activity</h2>
+          <p>
+            This demo reads the validated MODIS and VIIRS Parquet products through the local API.
+            Counts are hotspot observations—not unique wildfires.
+          </p>
+        </div>
+        <details>
+          <summary>What are H3 and FRP?</summary>
+          <p><strong>H3</strong> groups nearby observations into indexed map cells. The map plots their centres; area-normalized values use each cell’s actual size.</p>
+          <p><strong>FRP</strong> is Fire Radiative Power in megawatts: the estimated radiated power at observation time, not burned area or total energy.</p>
+        </details>
+      </section>
+
+      <section class="controls card" aria-label="Data filters">
+        <label>
+          Dataset
+          <select id="dataset">
+            <option value="viirs_noaa20">VIIRS NOAA-20</option>
+            <option value="modis">MODIS Aqua + Terra</option>
+          </select>
+        </label>
+        <label>
+          Month
+          <input id="month" type="month" min="2025-11" max="2026-11" value="2026-06" />
+        </label>
+        <label>
+          Region
+          <select id="region">
+            <option value="global">Global</option>
+            <option value="seasia">Southeast Asia</option>
+            <option value="amazon">Amazon basin</option>
+            <option value="africa">Central and southern Africa</option>
+          </select>
+        </label>
+        <label>
+          Grid detail
+          <select id="resolution">
+            <option value="4">H3 resolution 4 · global</option>
+            <option value="5">H3 resolution 5 · regional</option>
+          </select>
+        </label>
+        <label>
+          Map metric
+          <select id="metric">
+            <option value="detection_count">Hotspot observations</option>
+            <option value="detections_per_km2">Observations per km²</option>
+            <option value="frp_sum_mw">Total FRP</option>
+            <option value="frp_mw_per_km2">FRP per km²</option>
+          </select>
+        </label>
+        <button id="refresh" type="button">Update view</button>
+      </section>
+
+      <section class="overview" aria-label="Selected month overview">
+        <article class="stat card">
+          <span>Spatial cells shown</span>
+          <strong id="cell-count">—</strong>
+          <small id="cell-truncation">Awaiting query</small>
+        </article>
+        <article class="stat card">
+          <span>Actual observations loaded</span>
+          <strong id="point-count">—</strong>
+          <small id="point-truncation">Limited detail sample</small>
+        </article>
+        <article class="stat card">
+          <span>Selected period</span>
+          <strong id="period-status">—</strong>
+          <small id="period-detail">Coverage status</small>
+        </article>
+      </section>
+
+      <section class="workspace">
+        <article class="map-panel card">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Area-aware spatial summary</p>
+              <h2 id="map-title">Monthly activity map</h2>
+            </div>
+            <div class="legend"><span></span> lower <i></i> higher</div>
+          </div>
+          <div class="map-wrap" id="map-wrap">
+            <svg id="activity-map" viewBox="0 0 1000 500" role="img" aria-label="Spatial fire activity map"></svg>
+            <div class="loading" id="map-loading">Loading real spatial data…</div>
+          </div>
+          <p class="map-note">Circles mark occupied H3 cell centres and are scaled by the selected metric. Select a circle to inspect it.</p>
+        </article>
+
+        <aside class="detail card" aria-live="polite">
+          <p class="eyebrow">Selected H3 cell</p>
+          <h2 id="detail-title">Select a map cell</h2>
+          <dl id="cell-details">
+            <div><dt>Dataset</dt><dd>—</dd></div>
+            <div><dt>Platform</dt><dd>—</dd></div>
+            <div><dt>Observations</dt><dd>—</dd></div>
+            <div><dt>Detection density</dt><dd>—</dd></div>
+            <div><dt>FRP total</dt><dd>—</dd></div>
+            <div><dt>Cell area</dt><dd>—</dd></div>
+            <div><dt>Active days</dt><dd>—</dd></div>
+          </dl>
+        </aside>
+      </section>
+
+      <section class="card chart-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Sensor-aware timeline</p>
+            <h2>Monthly hotspot observations</h2>
+          </div>
+          <p>Platforms remain separate; lines are observations, not unique fires.</p>
+        </div>
+        <svg id="trend-chart" viewBox="0 0 1000 300" role="img" aria-label="Monthly hotspot observation trend"></svg>
+      </section>
+
+      <section class="card table-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Point-level layer</p>
+            <h2>Actual FIRMS observations</h2>
+          </div>
+          <p id="table-note">A bounded sample from the selected month and region.</p>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>UTC time</th><th>Platform</th><th>Latitude</th><th>Longitude</th>
+                <th>FRP MW</th><th>Confidence</th><th>Day/night</th><th>Stage</th>
+              </tr>
+            </thead>
+            <tbody id="observation-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <p class="error" id="error-message" role="alert"></p>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
