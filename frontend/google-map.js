@@ -1,4 +1,5 @@
 import { bindMapZoom } from "./map-zoom.js";
+import { cameraBounds } from "./map-detail.js";
 
 let loader;
 const minZoomRange = 50;
@@ -48,7 +49,7 @@ function cameraFor(bounds, aspect) {
   return { center: { lat, lng, altitude: 0 }, range, tilt: 0, heading: 0 };
 }
 
-export async function createGoogleMap(host, key, bounds, onSelect, onMove, onError) {
+export async function createGoogleMap(host, key, bounds, onSelect, onMove, onError, onViewportChange) {
   const maps = await loadMaps(key);
   const { Map3DElement, Polygon3DInteractiveElement } = await maps.importLibrary("maps3d");
   const camera = (area) => cameraFor(area, host.clientWidth / Math.max(1, host.clientHeight));
@@ -82,6 +83,7 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
   let ranked = [];
   let shown = new Map();
   let cellTimer;
+  let dots;
   function polygonFor(cell) {
     const inset = cell.size * .025;
     const south = cell.south + inset;
@@ -89,7 +91,12 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
     const west = cell.west + inset;
     const east = cell.west + cell.size - inset;
     const polygon = new Polygon3DInteractiveElement({
-      path: [
+      path: dots ? Array.from({ length: 8 }, (_, i) => {
+        const angle = i * Math.PI / 4;
+        const radius = cell.size * (.2 + .2 * cell.strength);
+        return { lat: cell.south + cell.size / 2 + radius * Math.sin(angle),
+          lng: cell.west + cell.size / 2 + radius * Math.cos(angle) };
+      }) : [
         { lat: south, lng: west },
         { lat: south, lng: east },
         { lat: north, lng: east },
@@ -153,8 +160,18 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
     throw error;
   }
   map.addEventListener("gmp-error", onError);
+  map.addEventListener("gmp-centerchange", onViewportChange);
+  map.addEventListener("gmp-rangechange", onViewportChange);
 
   return {
+    getViewport() {
+      if (!map.center || !Number.isFinite(map.range)) return;
+      const { lat, lng } = map.center;
+      const radius = map.range / 111320;
+      const aspect = host.clientWidth / Math.max(1, host.clientHeight);
+      const longitudeRadius = Math.min(180, radius * Math.max(1, aspect) / Math.max(.05, Math.cos(lat * Math.PI / 180)));
+      return cameraBounds(lat, lng, radius, longitudeRadius);
+    },
     changeZoom(factor) {
       cancelZoom();
       changeZoom(factor);
@@ -164,7 +181,12 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
       Object.assign(map, camera(area));
       reportCenter();
     },
-    setCells(items) {
+    setCells(items, showDots) {
+      if (dots !== showDots) {
+        for (const polygon of shown.values()) polygon.remove();
+        shown.clear();
+      }
+      dots = showDots;
       ranked = [...items].sort((a, b) => b.detection_count - a.detection_count);
       showNearbyCells();
     },

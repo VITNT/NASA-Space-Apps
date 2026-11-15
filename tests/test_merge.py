@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import unittest
-import json
-from pathlib import Path
 
 import duckdb
 
+from firms_pipeline.api import create_app
 from firms_pipeline.merge import ARCHIVE_CUTOFF_YEAR, merge_selection_sql
 
 
@@ -28,12 +27,9 @@ class MergePolicyTests(unittest.TestCase):
 class MergedDataIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.root = Path(__file__).resolve().parents[1]
-        cls.manifest = json.loads(
-            (cls.root / "data" / "catalog" / "merged_manifest.json").read_text(encoding="utf-8")
-        )
-        cls.monthly = cls.root / "data" / "merged" / "aggregates" / "monthly_global.parquet"
-        cls.daily = cls.root / "data" / "merged" / "aggregates" / "daily_global.parquet"
+        repository = create_app().state.repository
+        cls.manifest = repository.point_manifest
+        cls.daily = repository.daily_path
 
     def test_overlap_is_prevented_and_row_counts_reconcile(self) -> None:
         validation = self.manifest["validation"]

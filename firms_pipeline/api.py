@@ -22,6 +22,7 @@ Dataset = Literal["modis", "viirs_noaa20", "viirs_snpp"]
 Platform = Literal["aqua", "terra", "noaa20", "snpp"]
 ConfidenceClass = Literal["low", "nominal", "high"]
 DayNight = Literal["D", "N"]
+MAP_CELL_SIZES = tuple(2.0 ** exponent for exponent in range(-8, 2))
 
 
 class ResultPage(BaseModel):
@@ -129,7 +130,10 @@ def _repository(request: Request) -> DataRepository:
 
 
 def create_app(project_root: Path | None = None) -> FastAPI:
-    configured_root = project_root or Path(os.environ.get("FIRMS_PROJECT_ROOT", Path(__file__).resolve().parents[1]))
+    source_root = Path(__file__).resolve().parents[1]
+    local_archive = source_root / ".local" / "archive"
+    default_root = local_archive if local_archive.is_symlink() else source_root
+    configured_root = project_root or Path(os.environ.get("FIRMS_PROJECT_ROOT", default_root))
     repository = DataRepository(configured_root)
     app = FastAPI(
         title="NASA FIRMS Fire Activity API",
@@ -272,18 +276,28 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         max_lon: Annotated[float, Query(ge=-180, le=180)],
         dataset: Dataset | None = None,
         days: Annotated[list[date] | None, Query(max_length=31)] = None,
+        cell_size: float | None = None,
+        viewport: Annotated[list[float] | None, Query(min_length=4, max_length=4)] = None,
     ) -> MapGrid:
         _date_span(start_date, end_date, 31)
         if max_lat < min_lat:
             raise HTTPException(status_code=422, detail="Invalid latitude bounds")
         if days and any(day < start_date or day > end_date for day in days):
             raise HTTPException(status_code=422, detail="Selected days must be within the date range")
-        longitude_span = max_lon - min_lon
+        south, north, west, east = viewport or [min_lat, max_lat, min_lon, max_lon]
+        if not (-90 <= south <= north <= 90 and -180 <= west <= 180 and -180 <= east <= 180):
+            raise HTTPException(status_code=422, detail="Invalid map viewport bounds")
+        latitude_span = north - south
+        longitude_span = east - west
         if longitude_span < 0:
             longitude_span += 360
-        span = max(max_lat - min_lat, longitude_span)
-        # Use a finer grid for local views and keep the number of cells bounded for world views.
-        cell_size = next(size for threshold, size in ((12, .25), (60, .5), (100, 1), (360, 2)) if span <= threshold)
+        if cell_size is None:
+            span = max(latitude_span, longitude_span)
+            cell_size = next(size for threshold, size in ((12, .25), (60, .5), (100, 1), (360, 2)) if span <= threshold)
+        elif cell_size not in MAP_CELL_SIZES:
+            raise HTTPException(status_code=422, detail="Unsupported map cell size")
+        if (latitude_span / cell_size + 1) * (longitude_span / cell_size + 1) > 70_000:
+            raise HTTPException(status_code=422, detail="Map viewport is too large for this cell size")
         repo = _repository(request)
         longitude_sql, longitude_parameters = _bbox_clause(min_lon, max_lon)
         conditions = [
@@ -300,16 +314,31 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if days:
             conditions.append("acq_date IN (SELECT unnest(?::DATE[]))")
             parameters.append(days)
+        if viewport:
+            if any(bound % cell_size for bound in viewport):
+                raise HTTPException(status_code=422, detail="Map viewport must align to grid cells")
+            # Viewport edges fall between cells. Keep the lower edge inclusive
+            # so panning never changes the observations counted in a given cell.
+            longitude = "(CASE WHEN longitude = 180 THEN -180 ELSE longitude END)"
+            join = "AND" if west <= east else "OR"
+            conditions.extend([
+                "latitude >= ?",
+                "latitude <= ?" if north == 90 else "latitude < ?",
+                f"({longitude} >= ? {join} {longitude} < ?)",
+            ])
+            parameters.extend([south, north, west, east])
 
         data = repo.rows(f"""
             WITH observations AS (
                 SELECT floor(CASE WHEN longitude = 180 THEN -180 ELSE longitude END / {cell_size}) AS x,
                     least({90 / cell_size - 1}, floor(latitude / {cell_size})) AS y,
+                    latitude, CASE WHEN longitude = 180 THEN -180 ELSE longitude END AS point_longitude,
                     acq_date, platform, frp_mw
                 FROM {repo.points}
                 WHERE {' AND '.join(conditions)}
             )
             SELECT x * {cell_size} AS west, y * {cell_size} AS south,
+                avg(latitude) AS mean_latitude, avg(point_longitude) AS mean_longitude,
                 count(*) AS detection_count, count(DISTINCT acq_date) AS observed_days,
                 list(DISTINCT platform ORDER BY platform) AS platforms, sum(frp_mw)::DOUBLE AS frp_sum_mw
             FROM observations

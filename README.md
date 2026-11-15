@@ -17,8 +17,10 @@ python3 -m venv .venv
 Open [Burnline](http://127.0.0.1:8765/). FastAPI serves the UI, font, imagery,
 and data API from the same origin. Select an area or enter bounding coordinates,
 pick a month, and select a day, a week, or several days to see their detections.
-The map groups detections into square grid cells. Brighter cells have more detections,
-and selecting a cell opens its summary. History accepts a month range.
+The map opens on the global archive and uses orange activity dots at wide zoom
+levels. Zoom in to see progressively finer square cells for the visible area.
+Brighter marks contain more detections. Select one to open its summary.
+History accepts a month range.
 The app can export the calendar and individual hotspot rows as CSV and the map as PNG.
 
 Burnline opens with a dark basemap in MapLibre GL JS. It uses Natural Earth
@@ -70,7 +72,15 @@ FIRMS_PROJECT_ROOT="$PWD/.local/cambodia" .venv/bin/python -m uvicorn firms_pipe
 
 The preview uses only available country-years and labels its scope in the UI.
 Set `FIRMS_PROJECT_ROOT` to the directory containing the full archive's
-`data/` folder to use the global products.
+`data/` folder to use the global products. To save that location for future
+local launches, link the extracted archive once from the project directory:
+
+```sh
+mkdir -p .local
+ln -s "$HOME/Downloads/burnline-data" .local/archive
+```
+
+An explicit `FIRMS_PROJECT_ROOT` takes precedence over the saved local link.
 
 If you downloaded already-merged Parquet (a folder holding `merged/` and
 `catalog/`), adopt it without re-running ingestion:
@@ -228,6 +238,7 @@ The service provides:
 - `GET /v1/activity/daily`
 - `GET /v1/hotspots`
 - `GET /v1/summary/bbox`
+- `GET /v1/spatial/grid`
 - `GET /v1/spatial/monthly`
 
 Point queries require a dataset, date range, and bounding box. They are limited

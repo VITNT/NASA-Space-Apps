@@ -33,8 +33,8 @@
           <div class="filter-fields">
             <label for="region">Area of interest</label>
             <select id="region">
-              <option value="cambodia">Cambodia</option><option value="seasia">Southeast Asia</option>
-              <option value="global">Global</option><option value="amazon">Amazon basin</option>
+              <option value="global">Global</option><option value="cambodia">Cambodia</option>
+              <option value="seasia">Southeast Asia</option><option value="amazon">Amazon basin</option>
               <option value="africa">Central and southern Africa</option><option value="custom">Custom coordinates</option>
             </select>
             <form id="bounds" hidden>
@@ -48,7 +48,7 @@
             <select id="dataset"><option value="">Combined activity index</option></select>
           </div>
         </details>
-        <h2 id="area-name">Cambodia</h2>
+        <h2 id="area-name">Global</h2>
         <p class="status" id="api-status" role="status">Connecting</p>
       </aside>
 
@@ -138,9 +138,9 @@
     <p>The calendar counts each 0.1° grid cell once per UTC day when it contains a nominal- or high-confidence detection. Repeated passes and detections from multiple instruments in that cell share the same count. Known non-vegetation hotspots are excluded. Detections with no hotspot type remain eligible.</p>
     <p>Active cell-days are a shared activity index. Grid-cell area varies with latitude, and sensor sensitivity and overpass schedules can still affect the index. This measure cannot identify individual fires or burned area.</p>
     <p>The comparison uses up to five previous years for the same month and requires matching satellite coverage and at least two complete historical months. Coverage is inferred from monthly observation dates. Days without an activity bar have no qualifying records. Hatched months in History have no qualifying records.</p>
-    <p>The map groups NASA FIRMS MODIS and VIIRS detections into a latitude–longitude grid for the selected dates and satellite record. Larger regions use wider cells. Brighter cells contain more detections. Select a cell to see its detection count, days with detections, platforms, and summed fire radiative power (FRP) in megawatts. The Hotspots CSV contains individual detections. The dark map uses Natural Earth and geoBoundaries geography, and the satellite basemap adds NASA Blue Marble imagery.</p>
+    <p>The map groups NASA FIRMS MODIS and VIIRS detections into a latitude–longitude grid for the selected dates and satellite record. At wide zoom levels, dots mark occupied cells. Zoom in to see smaller grid cells. Brighter marks contain more detections. Select a mark to see its detection count, days with detections, platforms, and summed fire radiative power (FRP) in megawatts. The Hotspots CSV contains individual detections. The dark map uses Natural Earth and geoBoundaries geography, and the satellite basemap adds NASA Blue Marble imagery.</p>
     <p><a href="https://www.spaceappschallenge.org/2026/challenges/modis-and-viirs-hot-spots/" target="_blank" rel="noopener">NASA Space Apps 2026 ↗</a></p>
   </dialog>
-  <script type="module" src="/static/app.js?v=geography"></script>
+  <script type="module" src="/static/app.js?v=global-map"></script>
 </body>
 </html>

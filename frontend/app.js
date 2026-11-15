@@ -1,5 +1,6 @@
 import { createGlobe } from "./globe.js";
 import { enhanceSelect } from "./choice-menu.js";
+import { mapDetail } from "./map-detail.js";
 
 const $ = (id) => document.getElementById(id);
 const closeMenus = [
@@ -47,6 +48,10 @@ let calendar = [];
 let historyRows = [];
 let selectionRequest;
 let mapRequest;
+let exportRequest;
+let mapTimer;
+let mapKey;
+const mapCache = new Map();
 let historyRequest;
 let customBounds = asBounds(regions.cambodia);
 let view = "explore";
@@ -100,16 +105,18 @@ let satellite = false;
 let googleLoad;
 let mapLibreStatus = "";
 let mapCells = [];
+let mapDots = true;
 const globe = createGlobe($("globe"), showCell, (lat, lon) => {
   if (!googleGlobe && !mapLibre) showCoordinates(lat, lon);
+}, () => {
+  if (!googleGlobe && !mapLibre) scheduleMap();
 });
 const activeGlobe = () => googleGlobe ?? mapLibre ?? globe;
 
-function setCells(items) {
+function setCells(items, dots = mapDots) {
   mapCells = items;
-  globe.setCells(items);
-  mapLibre?.setCells(items);
-  googleGlobe?.setCells(items);
+  mapDots = dots;
+  activeGlobe().setCells(items, dots);
 }
 
 function centerMaps() {
@@ -117,6 +124,7 @@ function centerMaps() {
   globe.center(area);
   mapLibre?.center(area);
   googleGlobe?.center(area);
+  scheduleMap();
 }
 
 function updateMapView() {
@@ -140,6 +148,8 @@ function updateMapView() {
   $("download-visual").title = google ? "Switch to the dark map or NASA satellite to download a map PNG" : "Download map PNG";
   if (vectorMap) mapLibre.resize();
   activeGlobe().reportCenter?.();
+  activeGlobe().setCells(mapCells, mapDots);
+  scheduleMap();
 }
 
 function showLocalMap(flat) {
@@ -161,13 +171,14 @@ function selectBasemap(useSatellite) {
 
 async function initMapLibre() {
   try {
-    const { createMapLibreMap } = await import("./maplibre-map.js?v=geography");
+    const { createMapLibreMap } = await import("./maplibre-map.js");
     mapLibre = await createMapLibreMap($("maplibre"), showCell, (lat, lon) => {
       if (!googleGlobe) showCoordinates(lat, lon);
+    }, () => {
+      if (!googleGlobe) scheduleMap();
     });
     mapLibre.setFlat(flatMap);
     mapLibre.center(bounds());
-    mapLibre.setCells(mapCells);
     $("style-dark").disabled = false;
     $("style-satellite").disabled = false;
     updateMapView();
@@ -195,7 +206,7 @@ async function initGoogleMap() {
     status.textContent = "Loading Google 3D…";
     let map;
     try {
-      const { createGoogleMap } = await import("./google-map.js?v=labels-en");
+      const { createGoogleMap } = await import("./google-map.js");
       const initialBounds = bounds();
       map = await createGoogleMap($("google-globe"), config.googleMapsKey, initialBounds, showCell,
         (lat, lon) => { if (googleGlobe === map && map) showCoordinates(lat, lon); },
@@ -203,14 +214,13 @@ async function initGoogleMap() {
           if (!map || googleGlobe !== map) return;
           showLocalMap(flatMap);
           status.textContent = "Google 3D became unavailable.";
-        });
+        }, () => { if (googleGlobe === map) scheduleMap(); });
       if (googleLoad !== load) {
         map.destroy();
         return;
       }
       const area = bounds();
       if (Object.keys(area).some((key) => area[key] !== initialBounds[key])) map.center(area);
-      map.setCells(mapCells);
       googleGlobe = map;
       updateMapView();
       status.textContent = "";
@@ -238,8 +248,8 @@ function showDetails(title, values) {
 }
 
 function showCell(cell) {
-  showDetails("Selected grid cell", [
-    ["Center", `${coordinate(cell.latitude, "S", "N", 3)}, ${coordinate(cell.longitude, "W", "E", 3)}`],
+  showDetails(mapDots ? "Selected activity dot" : "Selected grid cell", [
+    [mapDots ? "Average location" : "Center", `${coordinate(cell.latitude, "S", "N", 3)}, ${coordinate(cell.longitude, "W", "E", 3)}`],
     ["Detections", format(cell.detection_count)],
     ["Days with detections", format(cell.observed_days)],
     ["Platforms", cell.platforms.map((platform) => platformNames[platform] ?? platform).join(", ")],
@@ -366,7 +376,7 @@ function applySelection(focusDate) {
   drawCalendar();
   if (focused) $("days").querySelector(`[data-date="${focusDate}"]`)?.focus();
   drawSelection();
-  loadMap();
+  resetMap();
 }
 
 function setMode(next) {
@@ -385,37 +395,73 @@ function highlightWeek(week) {
   for (const button of $("days").children) button.classList.toggle("peer", week !== undefined && button.dataset.week === week);
 }
 
-async function loadMap() {
+function scheduleMap() {
+  if (!firstPeriod || view !== "explore") return;
+  clearTimeout(mapTimer);
+  mapTimer = setTimeout(loadMap, 180);
+}
+
+function resetMap() {
+  clearTimeout(mapTimer);
   mapRequest?.abort();
-  const request = new AbortController();
-  mapRequest = request;
-  const { start, end } = dates(selectedPeriod);
-  const params = new URLSearchParams({
-    ...bounds(), ...sensorParam(), start_date: selected[0] ?? start, end_date: selected.at(-1) ?? end,
-  });
-  if (selected.length && !isRun()) {
-    for (const day of selected) params.append("days", day);
-  }
+  exportRequest?.abort();
+  exportRequest = new AbortController();
+  mapCache.clear();
+  mapKey = undefined;
   $("download-points").disabled = true;
   $("map-key-label").textContent = "";
   $("map-message").textContent = "Loading map observations…";
   setCells([]);
+  loadMap();
+}
+
+async function loadMap() {
+  const camera = activeGlobe().getViewport();
+  if (!camera) return;
+  const { dots, size, viewport } = mapDetail(camera);
+  const { start, end } = dates(selectedPeriod);
+  const params = new URLSearchParams({
+    ...bounds(), ...sensorParam(), start_date: selected[0] ?? start, end_date: selected.at(-1) ?? end, cell_size: size,
+  });
+  for (const bound of viewport ?? []) params.append("viewport", bound);
+  if (selected.length && !isRun()) {
+    for (const day of selected) params.append("days", day);
+  }
+  const key = `${dots}:${params}`;
+  if (key === mapKey) return;
+  mapKey = key;
+  mapRequest?.abort();
+  const request = new AbortController();
+  mapRequest = request;
   try {
-    const { data, cell_size: size } = await api("/v1/spatial/grid", params, request.signal);
-    if (request.signal.aborted) return;
-    setCells(data.map((row) => {
-      const strength = Math.min(1, Math.log2(row.detection_count) / 8);
-      const red = Math.round(133 + 122 * strength);
-      const green = Math.round(59 + 114 * strength);
-      const blue = Math.round(30 + 75 * strength);
-      const color = `rgba(${red}, ${green}, ${blue}, ${.72 + .2 * strength})`;
-      return { ...row, size, color, latitude: row.south + size / 2, longitude: row.west + size / 2 };
-    }));
-    $("download-points").disabled = !data.length;
-    $("map-key-label").textContent = `${size}° grid · brighter = more detections`;
-    $("map-message").textContent = data.length ? "" : "No mapped observations for this selection";
+    let items = mapCache.get(key);
+    if (!items) {
+      const { data } = await api("/v1/spatial/grid", params, request.signal);
+      if (request.signal.aborted) return;
+      items = data.map((row) => {
+        const strength = Math.min(1, Math.log2(row.detection_count) / 9);
+        const red = Math.round(149 + 106 * strength);
+        const green = Math.round(58 + 113 * strength);
+        const blue = Math.round(23 + 74 * strength);
+        const color = `rgba(${red}, ${green}, ${blue}, ${.56 + .38 * strength})`;
+        const latitude = dots ? row.mean_latitude : row.south + size / 2;
+        const longitude = dots ? row.mean_longitude : row.west + size / 2;
+        return { ...row, size, strength, color, latitude, longitude };
+      });
+    }
+    mapCache.delete(key);
+    mapCache.set(key, items);
+    if (mapCache.size > 5) mapCache.delete(mapCache.keys().next().value);
+    setCells(items, dots);
+    if (items.length) $("download-points").disabled = false;
+    const label = dots ? "Activity dots" : `${Number(size.toPrecision(4))}° grid`;
+    $("map-key-label").textContent = `${label} · brighter = more detections`;
+    $("map-message").textContent = items.length ? "" : "No mapped observations in this view";
   } catch (error) {
-    if (!request.signal.aborted) $("map-message").textContent = error.message;
+    if (!request.signal.aborted) {
+      mapKey = undefined;
+      $("map-message").textContent = error.message;
+    }
   }
 }
 
@@ -471,7 +517,7 @@ async function loadSelection() {
   $("coverage-note").textContent = "Loading calendar…";
   showDetails("Month overview", []);
   if (view === "history") loadHistory();
-  loadMap();
+  resetMap();
   try {
     const response = await api("/v1/calendar", { ...bbox, ...sensorParam(), start_date: start, end_date: end }, request.signal);
     if (request.signal.aborted) return;
@@ -543,7 +589,7 @@ function download(filename, blob) {
 
 async function downloadPoints() {
   const button = $("download-points");
-  const signal = mapRequest.signal;
+  const signal = exportRequest.signal;
   const period = selectedPeriod;
   const days = selected;
   const slug = selectionSlug();
@@ -655,7 +701,10 @@ function setView(next) {
   $("history").hidden = next !== "history";
   document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.view === next));
   if (next === "history") loadHistory();
-  else mapLibre?.resize();
+  else {
+    mapLibre?.resize();
+    scheduleMap();
+  }
 }
 
 async function init() {
@@ -673,7 +722,7 @@ async function init() {
     }
     if (!coverage.length) throw new Error("The archive contains no usable coverage.");
     areaLabel = health.area_label;
-    status(areaLabel ? areaLabel + " archive" : "FIRMS connected", "ready");
+    status(areaLabel ? areaLabel + " archive" : "Global FIRMS archive", "ready");
     for (const [key, name] of Object.entries(datasets)) {
       if (coverage.some((row) => row.dataset === key)) $("dataset").add(new Option(name, key));
     }
@@ -690,11 +739,16 @@ async function init() {
       yearOptions.append(new Option(String(year)));
     }
     $("period-year").replaceChildren(yearOptions);
-    selectPeriod(areaLabel && monthCoverage.has("2025-02") ? "2025-02" : latest);
+    if (areaLabel?.toLowerCase().includes("cambodia")) $("region").value = "cambodia";
+    const platforms = new Set(coverage.map((row) => row.platform)).size;
+    const latestComplete = [...monthCoverage.keys()].sort().reverse().find((period) =>
+      (monthCoverage.get(period) ?? []).filter((row) => row.is_complete_month && row.platform_complete).length === platforms);
+    selectPeriod(latestComplete ?? latest);
     $("period-month").disabled = false;
     $("period-year").disabled = false;
     $("history-start").value = first;
     $("history-end").value = latest;
+    centerMaps();
     loadSelection();
   } catch (error) {
     status("Archive unavailable", "error");

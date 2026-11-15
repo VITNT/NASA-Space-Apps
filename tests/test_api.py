@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from firms_pipeline.api import create_app
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
 class ApiIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.client = TestClient(create_app(PROJECT_ROOT))
+        cls.client = TestClient(create_app())
 
     def test_health_uses_validated_manifest(self) -> None:
         response = self.client.get("/health")
@@ -112,6 +107,30 @@ class ApiIntegrationTests(unittest.TestCase):
                 "max_lon": 180,
             },
         )
+        self.assertEqual(response.status_code, 422)
+
+    def test_viewport_grid_keeps_counts_stable_when_panning(self) -> None:
+        params = dict(
+            dataset="viirs_noaa20", start_date="2025-11-13", end_date="2025-11-15",
+            min_lat=-90, max_lat=90, min_lon=-180, max_lon=180, cell_size=0.125,
+            days=["2025-11-13", "2025-11-15"],
+        )
+        left = self.client.get("/v1/spatial/grid", params={**params, "viewport": [8, 16, 96, 108]})
+        right = self.client.get("/v1/spatial/grid", params={**params, "viewport": [8, 16, 100, 112]})
+        self.assertEqual(left.status_code, 200)
+        self.assertEqual(right.status_code, 200)
+        self.assertEqual(left.json()["cell_size"], 0.125)
+        shared_left = [row for row in left.json()["data"] if row["west"] >= 100]
+        shared_right = [row for row in right.json()["data"] if row["west"] < 108]
+        self.assertTrue(shared_left)
+        self.assertEqual(shared_left, shared_right)
+        self.assertTrue(all(row["observed_days"] <= 2 for row in shared_left))
+
+    def test_grid_rejects_a_worldwide_detail_request(self) -> None:
+        response = self.client.get("/v1/spatial/grid", params=dict(
+            start_date="2025-11-13", end_date="2025-11-13",
+            min_lat=-90, max_lat=90, min_lon=-180, max_lon=180, cell_size=0.125,
+        ))
         self.assertEqual(response.status_code, 422)
 
     def test_bbox_summary_reconciles_real_daily_world_count(self) -> None:

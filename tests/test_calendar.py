@@ -66,7 +66,10 @@ class CalendarTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["cell_size"], 0.25)
-        self.assertEqual(payload["data"][0], {
+        row = payload["data"][0]
+        self.assertAlmostEqual(row.pop("mean_latitude"), 12.02)
+        self.assertAlmostEqual(row.pop("mean_longitude"), 104.02333333333333)
+        self.assertEqual(row, {
             "west": 104.0, "south": 12.0, "detection_count": 3, "observed_days": 1,
             "platforms": ["snpp", "terra"], "frp_sum_mw": 15.0,
         })

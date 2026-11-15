@@ -1,5 +1,6 @@
 import { bindMapZoom } from "./map-zoom.js";
 import { createEarthRenderer } from "./earth-renderer.js";
+import { cameraBounds } from "./map-detail.js";
 
 const radians = Math.PI / 180;
 const degrees = 1 / radians;
@@ -12,7 +13,7 @@ const flatZoomMin = 1;
 const flatZoomMax = 48;
 const maxZoomTurn = 3;
 
-export function createGlobe(canvas, onSelect, onMove) {
+export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
   const ctx = canvas.getContext("2d");
   const earthCanvas = document.createElement("canvas");
   earthCanvas.id = "globe-earth";
@@ -32,12 +33,14 @@ export function createGlobe(canvas, onSelect, onMove) {
   let cells = [];
   let cellsByLocation = new Map();
   let cellSize;
+  let dots = true;
   let frame;
   let drag;
   let geometry;
   let base;
   let reportedLatitude;
   let reportedLongitude;
+  let reportedViewport;
 
   function loadFallbackImage() {
     if (!earth.naturalWidth || source) return;
@@ -122,23 +125,39 @@ export function createGlobe(canvas, onSelect, onMove) {
       const first = west + worldWidth * Math.ceil((-size - west) / worldWidth);
       ctx.fillStyle = cell.color;
       for (let x = first; x < width; x += worldWidth) {
-        ctx.fillRect(x + inset, y + inset, size - 2 * inset, size - 2 * inset);
+        if (dots) drawDot(cell, x + (cell.longitude - cell.west) * pixelsPerDegree,
+          y + (cell.south + cellSize - cell.latitude) * pixelsPerDegree);
+        else ctx.fillRect(x + inset, y + inset, size - 2 * inset, size - 2 * inset);
       }
     }
+  }
+
+  function drawDot(cell, x, y) {
+    ctx.beginPath();
+    ctx.arc(x, y, .7 + cell.strength * 1.4, 0, Math.PI * 2);
+    ctx.fill();
   }
 
   function drawGlobeCells(width, height, centerX, centerY, radius, sinLat, cosLat) {
     const sinLon = Math.sin(longitude * radians);
     const cosLon = Math.cos(longitude * radians);
-    for (const { cell, corners } of cells) {
-      const projected = corners.map(({ east, north, up }) => {
-        const forward = north * cosLon + east * sinLon;
-        return {
-          x: east * cosLon - north * sinLon,
-          y: up * cosLat - forward * sinLat,
-          depth: up * sinLat + forward * cosLat,
-        };
-      });
+    function project({ east, north, up }) {
+      const forward = north * cosLon + east * sinLon;
+      return {
+        x: east * cosLon - north * sinLon,
+        y: up * cosLat - forward * sinLat,
+        depth: up * sinLat + forward * cosLat,
+      };
+    }
+    for (const { cell, corners, center } of cells) {
+      if (dots) {
+        const { x, y, depth } = project(center);
+        if (depth <= 0) continue;
+        ctx.fillStyle = cell.color;
+        drawDot(cell, centerX + radius * x, centerY - radius * y);
+        continue;
+      }
+      const projected = corners.map(project);
       if (projected.every(({ depth }) => depth <= 0)
         || projected.every(({ x }) => centerX + radius * x < 0)
         || projected.every(({ x }) => centerX + radius * x > width)
@@ -192,6 +211,20 @@ export function createGlobe(canvas, onSelect, onMove) {
     return cellsByLocation.get(`${south},${west}`);
   }
 
+  function getViewport() {
+    const { width, height } = canvas.getBoundingClientRect();
+    if (!width || !height) return;
+    if (flat) {
+      const scale = 180 / (flatMapWidth(width, height) * flatZoom);
+      return cameraBounds(latitude, longitude, height * scale, width * scale);
+    }
+    const diagonal = Math.hypot(width / 2, height * (1 - globeCenterY));
+    const angle = Math.asin(Math.min(1, diagonal / (globeRadius(width, height) * zoom)));
+    const lonRadius = Math.abs(latitude) + angle * degrees >= 90
+      ? 180 : Math.asin(Math.sin(angle) / Math.cos(latitude * radians)) * degrees;
+    return cameraBounds(latitude, longitude, angle * degrees, lonRadius);
+  }
+
   function draw(fullResolution = false) {
     frame = undefined;
     const box = canvas.getBoundingClientRect();
@@ -231,6 +264,11 @@ export function createGlobe(canvas, onSelect, onMove) {
       reportedLatitude = latitude;
       reportedLongitude = longitude;
       onMove(latitude, longitude);
+    }
+    const viewport = [key, flat, flatZoom].join(",");
+    if (viewport !== reportedViewport) {
+      reportedViewport = viewport;
+      onViewportChange();
     }
   }
 
@@ -364,6 +402,7 @@ export function createGlobe(canvas, onSelect, onMove) {
 
   return {
     changeZoom: zoomBy,
+    getViewport,
     setFlat(enabled) {
       cancelZoom();
       flat = enabled;
@@ -397,10 +436,12 @@ export function createGlobe(canvas, onSelect, onMove) {
         : 1;
       redraw();
     },
-    setCells(items) {
+    setCells(items, showDots) {
+      dots = showDots;
       cellSize = items[0]?.size;
       cellsByLocation = new Map(items.map((cell) => [`${cell.south},${cell.west}`, cell]));
       cells = items.map((cell) => {
+        if (dots) return { cell, center: spherePoint(cell.latitude, cell.longitude) };
         const inset = cell.size * .025;
         const south = cell.south + inset;
         const west = cell.west + inset;

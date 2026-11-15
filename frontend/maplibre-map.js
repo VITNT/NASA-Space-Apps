@@ -3,6 +3,7 @@ import { addGeography, loadBasemap } from "./geography.js";
 const mapLibreDist = "https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.2/dist/";
 const blueMarbleTiles = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpeg";
 const fireLayer = "burnline-fire-grid";
+const dotLayer = "burnline-fire-dots";
 const satelliteLayer = "burnline-blue-marble";
 const emptyGrid = { type: "FeatureCollection", features: [] };
 const mercatorLimit = 85.051129;
@@ -39,7 +40,12 @@ async function loadMapLibre() {
 
 const cellKey = (cell) => `${cell.west},${cell.south},${cell.size}`;
 
-function cellFeature(cell) {
+function cellFeature(cell, dots) {
+  const properties = { key: cellKey(cell), color: cell.color, strength: cell.strength };
+  if (dots) {
+    if (Math.abs(cell.latitude) > mercatorLimit) return [];
+    return [{ type: "Feature", properties, geometry: { type: "Point", coordinates: [cell.longitude, cell.latitude] } }];
+  }
   const inset = cell.size * .025;
   const west = cell.west + inset;
   const east = cell.west + cell.size - inset;
@@ -48,7 +54,7 @@ function cellFeature(cell) {
   if (south >= north) return [];
   return [{
     type: "Feature",
-    properties: { key: cellKey(cell), color: cell.color },
+    properties,
     geometry: { type: "Polygon", coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]] },
   }];
 }
@@ -72,13 +78,13 @@ function waitForBasemap(map) {
   });
 }
 
-export async function createMapLibreMap(host, onSelect, onMove) {
+export async function createMapLibreMap(host, onSelect, onMove, onViewportChange) {
   const [maplibre, style] = await Promise.all([loadMapLibre(), loadBasemap()]);
   const map = new maplibre.Map({
     container: host,
     style,
-    center: [104.8, 17],
-    zoom: 3.5,
+    center: [0, 0],
+    zoom: 1,
     attributionControl: false,
     canvasContextAttributes: { preserveDrawingBuffer: true },
     dragRotate: false,
@@ -88,12 +94,15 @@ export async function createMapLibreMap(host, onSelect, onMove) {
   });
   let items = new Map();
   let satellite = false;
+  let flat = false;
 
   function center(area) {
     const west = area.min_lon;
     const east = area.max_lon < west ? area.max_lon + 360 : area.max_lon;
     if (east - west >= 359) {
-      map.jumpTo({ center: [0, 0], zoom: 1 });
+      const side = Math.min(host.clientWidth, host.clientHeight);
+      const zoom = Math.log2(Math.max(1, side) / (flat ? 512 : 220));
+      map.jumpTo({ center: [0, 0], zoom });
       return;
     }
     const south = Math.max(-mercatorLimit, Math.min(mercatorLimit, area.min_lat));
@@ -123,7 +132,18 @@ export async function createMapLibreMap(host, onSelect, onMove) {
     map.addSource(fireLayer, { type: "geojson", data: emptyGrid });
     map.addLayer({
       id: fireLayer, type: "fill", source: fireLayer,
+      filter: ["==", ["geometry-type"], "Polygon"],
       paint: { "fill-color": ["to-color", ["get", "color"]], "fill-antialias": false },
+    });
+    map.addLayer({
+      id: dotLayer, type: "circle", source: fireLayer,
+      filter: ["==", ["geometry-type"], "Point"],
+      paint: {
+        "circle-color": ["to-color", ["get", "color"]],
+        "circle-radius": ["interpolate", ["linear"], ["zoom"],
+          0, ["+", .6, ["*", .65, ["get", "strength"]]],
+          5, ["+", .85, ["*", 1.3, ["get", "strength"]]]],
+      },
     });
   } catch (error) {
     map.remove();
@@ -132,9 +152,13 @@ export async function createMapLibreMap(host, onSelect, onMove) {
 
   const refreshGeography = addGeography(map);
   map.on("move", reportCenter);
-  map.on("mouseenter", fireLayer, () => { map.getCanvas().style.cursor = "pointer"; });
-  map.on("mouseleave", fireLayer, () => { map.getCanvas().style.cursor = ""; });
-  map.on("click", fireLayer, ({ features }) => {
+  map.on("moveend", onViewportChange);
+  for (const layer of [fireLayer, dotLayer]) {
+    map.on("mouseenter", layer, () => { map.getCanvas().style.cursor = "pointer"; });
+    map.on("mouseleave", layer, () => { map.getCanvas().style.cursor = ""; });
+  }
+  map.on("click", (event) => {
+    const features = map.queryRenderedFeatures(event.point, { layers: [fireLayer, dotLayer] });
     const cell = items.get(features[0]?.properties.key);
     if (cell) onSelect(cell);
   });
@@ -144,11 +168,18 @@ export async function createMapLibreMap(host, onSelect, onMove) {
   return {
     center,
     reportCenter,
+    getViewport() {
+      const area = map.getBounds();
+      const west = area.getWest();
+      const east = area.getEast();
+      return [area.getSouth(), area.getNorth(), west, east < west ? east + 360 : east];
+    },
     resize: () => map.resize(),
     changeZoom(factor) {
       map.zoomTo(map.getZoom() + Math.log2(factor), { duration: 180 });
     },
-    setFlat(flat) {
+    setFlat(enabled) {
+      flat = enabled;
       map.setProjection({ type: flat ? "mercator" : "globe" });
       refreshGeography();
     },
@@ -159,9 +190,9 @@ export async function createMapLibreMap(host, onSelect, onMove) {
       map.setLayoutProperty("land", "visibility", enabled ? "none" : "visible");
       map.setPaintProperty("coast", "line-color", enabled ? "rgba(255, 255, 255, .55)" : "#33424e");
     },
-    setCells(cells) {
+    setCells(cells, dots) {
       items = new Map(cells.map((cell) => [cellKey(cell), cell]));
-      map.getSource(fireLayer).setData({ type: "FeatureCollection", features: cells.flatMap(cellFeature) });
+      map.getSource(fireLayer).setData({ type: "FeatureCollection", features: cells.flatMap((cell) => cellFeature(cell, dots)) });
     },
     exportImage(callback) {
       const output = document.createElement("canvas");
