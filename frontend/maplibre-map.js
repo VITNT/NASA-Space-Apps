@@ -1,10 +1,12 @@
 import { addGeography, loadBasemap } from "./geography.js";
-import { octagon } from "./map-detail.js";
+import { octagon, pointColors, pointOutline, pointSelection } from "./map-detail.js";
 
 const mapLibreDist = "https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.2/dist/";
 const blueMarbleTiles = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpeg";
 const fireLayer = "luminite-fire-grid";
 const dotLayer = "luminite-fire-dots";
+const pointLayer = "luminite-fire-points";
+const selectionLayer = "luminite-fire-selection";
 const satelliteLayer = "luminite-blue-marble";
 const emptyGrid = { type: "FeatureCollection", features: [] };
 const mercatorLimit = 85.051129;
@@ -72,7 +74,7 @@ function waitForBasemap(map) {
   });
 }
 
-export async function createMapLibreMap(host, onSelect, onMove, onViewportChange) {
+export async function createMapLibreMap(host, onSelect, onMove, onViewportChange, onSelectPoints) {
   const [maplibre, style] = await Promise.all([loadMapLibre(), loadBasemap()]);
   const map = new maplibre.Map({
     container: host,
@@ -87,6 +89,7 @@ export async function createMapLibreMap(host, onSelect, onMove, onViewportChange
     maxPitch: 0,
   });
   let items = new Map();
+  let points = [];
   let satellite = false;
   let flat = false;
 
@@ -95,7 +98,7 @@ export async function createMapLibreMap(host, onSelect, onMove, onViewportChange
     const east = area.max_lon < west ? area.max_lon + 360 : area.max_lon;
     if (east - west >= 359) {
       const side = Math.min(host.clientWidth, host.clientHeight);
-      const zoom = Math.log2(Math.max(1, side) / (flat ? 512 : 220));
+      const zoom = Math.log2(Math.max(1, side) / (flat ? 512 : 150));
       map.jumpTo({ center: [0, 0], zoom });
       return;
     }
@@ -135,8 +138,34 @@ export async function createMapLibreMap(host, onSelect, onMove, onViewportChange
       paint: {
         "circle-color": ["to-color", ["get", "color"]],
         "circle-radius": ["interpolate", ["linear"], ["zoom"],
-          0, ["+", .6, ["*", .65, ["get", "strength"]]],
-          5, ["+", .85, ["*", 1.3, ["get", "strength"]]]],
+          0, ["+", 1.1, ["*", .9, ["get", "strength"]]],
+          5, ["+", 1.5, ["*", 1.7, ["get", "strength"]]],
+          10, ["+", 2.2, ["*", 2.2, ["get", "strength"]]]],
+        "circle-stroke-color": pointOutline,
+        "circle-stroke-width": .6,
+      },
+    });
+    // Individual detections at their reported positions, strongest on top.
+    const pointRadius = (extra) => ["interpolate", ["linear"], ["zoom"], 0, 2.4 + extra, 6, 3.2 + extra, 10, 4.6 + extra, 14, 7 + extra];
+    map.addSource(pointLayer, { type: "geojson", data: emptyGrid });
+    map.addLayer({
+      id: pointLayer, type: "circle", source: pointLayer,
+      layout: { "circle-sort-key": ["get", "level"] },
+      paint: {
+        "circle-color": ["match", ["get", "level"], 2, pointColors[2], 1, pointColors[1], pointColors[0]],
+        "circle-radius": pointRadius(0),
+        "circle-stroke-color": pointOutline,
+        "circle-stroke-width": .8,
+      },
+    });
+    map.addSource(selectionLayer, { type: "geojson", data: emptyGrid });
+    map.addLayer({
+      id: selectionLayer, type: "circle", source: selectionLayer,
+      paint: {
+        "circle-color": "rgba(0, 0, 0, 0)",
+        "circle-radius": pointRadius(5),
+        "circle-stroke-color": pointSelection,
+        "circle-stroke-width": 2,
       },
     });
   } catch (error) {
@@ -147,13 +176,27 @@ export async function createMapLibreMap(host, onSelect, onMove, onViewportChange
   const refreshGeography = addGeography(map);
   map.on("move", reportCenter);
   map.on("moveend", onViewportChange);
-  for (const layer of [fireLayer, dotLayer]) {
+  for (const layer of [fireLayer, dotLayer, pointLayer]) {
     map.on("mouseenter", layer, () => { map.getCanvas().style.cursor = "pointer"; });
     map.on("mouseleave", layer, () => { map.getCanvas().style.cursor = ""; });
   }
   map.on("click", (event) => {
-    const features = map.queryRenderedFeatures(event.point, { layers: [fireLayer, dotLayer] });
-    const cell = items.get(features[0]?.properties.key);
+    const { x, y } = event.point;
+    const near = (reach) => [[x - reach, y - reach], [x + reach, y + reach]];
+    const distance = (item) => {
+      const spot = map.project([item.longitude, item.latitude]);
+      return Math.hypot(spot.x - x, spot.y - y);
+    };
+    // Detections within a fingertip of the pointer, nearest first.
+    const indexes = new Set(map.queryRenderedFeatures(near(8), { layers: [pointLayer] }).map((feature) => feature.properties.index));
+    if (indexes.size) {
+      onSelectPoints([...indexes].map((index) => points[index]).filter(Boolean).sort((a, b) => distance(a) - distance(b)));
+      return;
+    }
+    const features = map.queryRenderedFeatures(event.point, { layers: [fireLayer] });
+    const dots = map.queryRenderedFeatures(near(5), { layers: [dotLayer] })
+      .map((feature) => items.get(feature.properties.key)).filter(Boolean).sort((a, b) => distance(a) - distance(b));
+    const cell = dots[0] ?? items.get(features[0]?.properties.key);
     if (cell) onSelect(cell);
   });
   const canvas = map.getCanvas();
@@ -187,6 +230,23 @@ export async function createMapLibreMap(host, onSelect, onMove, onViewportChange
     setCells(cells, dots) {
       items = new Map(cells.map((cell) => [cellKey(cell), cell]));
       map.getSource(fireLayer).setData({ type: "FeatureCollection", features: cells.flatMap((cell) => cellFeature(cell, dots)) });
+    },
+    setPoints(list) {
+      points = list;
+      map.getSource(selectionLayer).setData(emptyGrid);
+      map.getSource(pointLayer).setData({
+        type: "FeatureCollection",
+        features: list.flatMap((item, index) => Math.abs(item.latitude) > mercatorLimit ? [] : [{
+          type: "Feature",
+          properties: { index, level: item.level },
+          geometry: { type: "Point", coordinates: [item.longitude, item.latitude] },
+        }]),
+      });
+    },
+    selectPoint(item) {
+      map.getSource(selectionLayer).setData(item ? {
+        type: "Feature", properties: {}, geometry: { type: "Point", coordinates: [item.longitude, item.latitude] },
+      } : emptyGrid);
     },
     exportImage(callback) {
       const output = document.createElement("canvas");

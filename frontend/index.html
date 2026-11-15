@@ -5,19 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Explore satellite-observed burning activity from NASA FIRMS.">
   <title>FIRMS Fire Activity Explorer · Luminite</title>
-  <link rel="stylesheet" href="/static/styles.css?v=flight-camera">
+  <link rel="stylesheet" href="/static/styles.css?v=ramps">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <h1>Luminite</h1>
-      <span>NASA FIRMS</span>
     </div>
     <nav aria-label="Workspace">
       <button type="button" data-view="explore" aria-pressed="true">Explore</button>
       <button type="button" data-view="history" aria-pressed="false">History</button>
       <button type="button" id="take-orbit" data-view="flight" aria-pressed="false">Take orbit</button>
-      <button type="button" id="about">Methodology</button>
     </nav>
   </header>
 
@@ -29,6 +27,7 @@
       <p class="map-message" id="map-message" role="status"></p>
 
       <aside class="location" aria-label="Area and activity">
+        <div class="location-actions">
         <details class="filters">
           <summary>Area &amp; data <span class="chevron" aria-hidden="true"></span></summary>
           <div class="filter-fields">
@@ -49,6 +48,26 @@
             <select id="dataset"><option value="">Combined activity index</option></select>
           </div>
         </details>
+        <details class="filters export-menu" id="export-menu">
+          <summary><span class="download-icon" aria-hidden="true"></span>Download <span class="chevron" aria-hidden="true"></span></summary>
+          <div class="filter-fields export-fields">
+            <p class="export-scope" id="export-scope"></p>
+            <button type="button" class="export-option" id="download-points" aria-describedby="export-points-note">
+              <strong>Hotspots CSV</strong>
+              <span id="export-points-note">Every detection in this search, one row each.</span>
+            </button>
+            <button type="button" class="export-option" id="download-calendar" aria-describedby="export-calendar-note">
+              <strong>Calendar CSV</strong>
+              <span id="export-calendar-note">One row per day: activity, its colour class and satellite coverage.</span>
+            </button>
+            <button type="button" class="export-option" id="download-map" aria-describedby="export-map-note">
+              <strong>Map image</strong>
+              <span id="export-map-note">PNG of the current map view.</span>
+            </button>
+            <p class="export-footnote">Monthly history for this area is in <button type="button" class="link-button" data-view="history">History</button>.</p>
+          </div>
+        </details>
+        </div>
         <h2 id="area-name">Global</h2>
         <p class="status" id="api-status" role="status">Connecting</p>
       </aside>
@@ -65,6 +84,7 @@
           </details>
           <p class="activity-value"><strong id="activity">—</strong> active cell-days</p>
           <p class="comparison"><strong id="anomaly">—</strong> vs same-month median</p>
+          <p class="coverage-label" id="coverage-label" data-state="none"></p>
           <p id="coverage-note" role="status">Checking archive coverage…</p>
         </aside>
 
@@ -79,7 +99,10 @@
             </div>
           </header>
           <div class="days" id="days" data-mode="day" aria-label="Days of the month"></div>
-          <p class="timeline-hint"><span id="map-key-label"></span><span id="map-coordinates"></span></p>
+          <div class="timeline-hint">
+            <ul class="legend" id="calendar-legend" aria-label="Active cells per day"></ul>
+            <span id="map-key-label"></span><span id="map-coordinates"></span>
+          </div>
         </section>
 
         <section class="date-readout" aria-label="Observation date">
@@ -91,10 +114,6 @@
             <label for="period-year" hidden>Choose year</label>
             <select class="month-picker" id="period-year" aria-label="Choose year" disabled></select>
             <button type="button" id="next" aria-label="Next month">›</button>
-          </div>
-          <div class="exports">
-            <button type="button" id="download-calendar">Calendar CSV</button>
-            <button type="button" id="download-points" title="Up to 5,000 original detections per satellite record">Hotspots CSV</button>
           </div>
         </section>
       </div>
@@ -148,27 +167,9 @@
         </div>
       </div>
 
-      <aside class="flight-inspector" aria-label="Recorded detections">
-        <details class="filters">
-          <summary>Observation data <span class="chevron" aria-hidden="true"></span></summary>
-          <div class="filter-fields">
-            <label for="flight-date">Date (UTC)</label>
-            <input id="flight-date" type="date" value="2025-03-08" required>
-            <label for="flight-sensor">Instrument</label>
-            <select id="flight-sensor">
-              <option value="">MODIS + VIIRS</option>
-              <option value="terra">Terra / MODIS</option>
-              <option value="aqua">Aqua / MODIS</option>
-              <option value="noaa20">NOAA-20 / VIIRS</option>
-              <option value="snpp">Suomi NPP / VIIRS</option>
-            </select>
-          </div>
-        </details>
-        <div class="flight-legend">
-          <span class="flight-modis">MODIS</span>
-          <span class="flight-viirs">VIIRS</span>
-        </div>
-        <p class="status">Simulated flight · Recorded NASA FIRMS detections</p>
+      <aside class="flight-inspector" aria-label="Mapped activity">
+        <p id="flight-selection"></p>
+        <p class="status">Simulated flight · Same NASA FIRMS activity as the globe</p>
         <p id="flight-data-status" class="status" role="status"></p>
         <p id="flight-detection" role="status" hidden></p>
       </aside>
@@ -176,7 +177,7 @@
       <div class="flight-dock">
         <div class="flight-guide">
           <p><kbd>W</kbd> Forward · <kbd>A</kbd><kbd>D</kbd> Steer · <kbd>S</kbd> Reverse · <kbd>Shift</kbd> Boost</p>
-          <p>Scroll or <kbd>+</kbd><kbd>−</kbd> to zoom. Select a marker to inspect it.</p>
+          <p>Scroll or <kbd>+</kbd><kbd>−</kbd> to zoom. Select a dot or cell to inspect it.</p>
         </div>
         <div class="basemap-options flight-controls" aria-label="Flight controls">
           <button type="button" data-flight-control="left" aria-label="Turn left">←</button>
@@ -201,23 +202,23 @@
           <label>From <input type="month" id="history-start" required></label>
           <label>To <input type="month" id="history-end" required></label>
           <button>Apply range</button>
-          <button type="button" id="download-history">History CSV</button>
+          <button type="button" id="download-history" class="download-pill"><span class="download-icon" aria-hidden="true"></span>History CSV</button>
         </form>
       </div>
       <p id="history-note" class="muted" role="status"></p>
       <p id="history-trend" class="history-trend" role="status" hidden></p>
+      <div class="history-key">
+        <div class="calendar-modes history-shade" role="group" aria-label="Shade months by">
+          <button type="button" data-shade="activity" aria-pressed="true" title="Shade by active cell-days">Activity</button>
+          <button type="button" data-shade="anomaly" aria-pressed="false" title="Shade by difference from the median of up to five earlier years of the same month">vs median</button>
+        </div>
+        <ul class="legend" id="history-legend" aria-label="Colour key"></ul>
+        <p class="coverage-key"><span class="coverage-ticks" aria-hidden="true"><i data-state="full"></i><i data-state="partial"></i></span>
+          Satellites, in order: <span id="history-ticks"></span>. Solid tick = whole month, hollow = part of it.</p>
+      </div>
       <div class="history-scroll"><table id="history-table"></table></div>
     </section>
   </main>
-  <dialog id="methodology">
-    <form method="dialog"><button aria-label="Close methodology">×</button></form>
-    <h2>How activity is measured</h2>
-    <p>The calendar counts each 0.1° grid cell once per UTC day when it contains a nominal- or high-confidence detection. Repeated passes and detections from multiple instruments in that cell share the same count. Known non-vegetation hotspots are excluded. Detections with no hotspot type remain eligible.</p>
-    <p>Active cell-days are a shared activity index. Grid-cell area varies with latitude. Comparisons across months are adjusted for the satellites flying at the time, using factors measured where the satellites overlap; the adjustment is statistical and most reliable for large areas and whole months. This measure cannot identify individual fires or burned area.</p>
-    <p>The comparison uses up to five previous years for the same month and requires matching satellite coverage and at least two complete historical months. Coverage is inferred from monthly observation dates. Days without an activity bar have no qualifying records. Hatched months in History have no qualifying records.</p>
-    <p>The map groups NASA FIRMS MODIS and VIIRS detections into a latitude–longitude grid for the selected dates and satellite record. At wide zoom levels, dots mark occupied cells. Zoom in to see smaller grid cells. Brighter marks contain more detections. Select a mark to see its detection count, days with detections, platforms, and summed fire radiative power (FRP) in megawatts. The Hotspots CSV contains individual detections. The dark map uses Natural Earth and geoBoundaries geography, and the satellite basemap adds NASA Blue Marble imagery.</p>
-    <p><a href="https://www.spaceappschallenge.org/2026/challenges/modis-and-viirs-hot-spots/" target="_blank" rel="noopener">NASA Space Apps 2026 ↗</a></p>
-  </dialog>
-  <script type="module" src="/static/app.js?v=flight-camera"></script>
+  <script type="module" src="/static/app.js?v=ramps"></script>
 </body>
 </html>

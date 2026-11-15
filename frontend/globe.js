@@ -1,6 +1,6 @@
 import { bindMapZoom } from "./map-zoom.js";
 import { createEarthRenderer } from "./earth-renderer.js";
-import { cameraBounds, octagon } from "./map-detail.js";
+import { cameraBounds, octagon, pointColors, pointOutline, pointSelection } from "./map-detail.js";
 
 const radians = Math.PI / 180;
 const degrees = 1 / radians;
@@ -13,7 +13,7 @@ const flatZoomMin = 1;
 const flatZoomMax = 48;
 const maxZoomTurn = 3;
 
-export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot = false } = {}) {
+export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot = false, onSelectPoints } = {}) {
   const ctx = canvas.getContext("2d");
   const earthCanvas = document.createElement("canvas");
   earthCanvas.id = `${canvas.id}-earth`;
@@ -35,6 +35,13 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
   let cellsByLocation = new Map();
   let cellSize;
   let dots = true;
+  // Individual detections: unit vectors, and where each was last drawn on the canvas.
+  let points = [];
+  let pointVectors = new Float64Array(0);
+  let pointScreen = new Float32Array(0);
+  let selectedPoint = -1;
+  // Canvas pixels per CSS pixel.
+  let unit = 1;
   let frame;
   let drag;
   let geometry;
@@ -42,8 +49,6 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
   let reportedLatitude;
   let reportedLongitude;
   let reportedViewport;
-  let detections = [];
-  let hitTargets = [];
 
   function loadFallbackImage() {
     if (!earth.naturalWidth || source) return;
@@ -129,6 +134,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
       const west = centerX + (cell.west - longitude) * pixelsPerDegree;
       const first = west + worldWidth * Math.ceil((-size - west) / worldWidth);
       ctx.fillStyle = cell.color;
+      if (dots) outlineDots();
       for (let x = first; x < width; x += worldWidth) {
         if (dots) drawDot(cell, x + (cell.longitude - cell.west) * pixelsPerDegree,
           y + (cell.south + cellSize - cell.latitude) * pixelsPerDegree);
@@ -137,8 +143,87 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
     }
   }
 
+  function outlineDots() {
+    ctx.strokeStyle = pointOutline;
+    ctx.lineWidth = .7 * unit;
+  }
+
   function drawDot(cell, x, y) {
-    drawOctagon(x, y, .7 + cell.strength * 1.4);
+    drawOctagon(x, y, (1.6 + cell.strength * 1.6) * unit);
+    ctx.stroke();
+  }
+
+  // Every detection at its reported position, strongest on top.
+  function drawPoints(width, height, centerX, centerY, radius, worldWidth, sinLat, cosLat, sinBearing, cosBearing) {
+    const size = (2.4 + Math.min(2.6, Math.log2(flat ? flatZoom : zoom) * .55)) * unit;
+    const margin = size + 2;
+    pointScreen.fill(NaN);
+    if (flat) {
+      const pixelsPerDegree = worldWidth / 360;
+      for (let i = 0; i < points.length; i++) {
+        const y = centerY - (points[i].latitude - latitude) * pixelsPerDegree;
+        if (y < -margin || y > height + margin) continue;
+        let x = centerX + (points[i].longitude - longitude) * pixelsPerDegree;
+        x += worldWidth * Math.ceil((-margin - x) / worldWidth);
+        if (x > width + margin) continue;
+        pointScreen[2 * i] = x;
+        pointScreen[2 * i + 1] = y;
+      }
+    } else {
+      const sinLon = Math.sin(longitude * radians);
+      const cosLon = Math.cos(longitude * radians);
+      for (let i = 0; i < points.length; i++) {
+        const east = pointVectors[3 * i];
+        const north = pointVectors[3 * i + 1];
+        const up = pointVectors[3 * i + 2];
+        const forward = north * cosLon + east * sinLon;
+        if (up * sinLat + forward * cosLat <= 0) continue;
+        const across = east * cosLon - north * sinLon;
+        const above = up * cosLat - forward * sinLat;
+        const x = centerX + radius * (across * cosBearing - above * sinBearing);
+        const y = centerY - radius * (across * sinBearing + above * cosBearing);
+        if (x < -margin || x > width + margin || y < -margin || y > height + margin) continue;
+        pointScreen[2 * i] = x;
+        pointScreen[2 * i + 1] = y;
+      }
+    }
+    ctx.strokeStyle = pointOutline;
+    ctx.lineWidth = .8 * unit;
+    pointColors.forEach((color, level) => {
+      ctx.beginPath();
+      for (let i = 0; i < points.length; i++) {
+        const x = pointScreen[2 * i];
+        if (points[i].level !== level || x !== x) continue;
+        ctx.moveTo(x + size, pointScreen[2 * i + 1]);
+        ctx.arc(x, pointScreen[2 * i + 1], size, 0, 2 * Math.PI);
+      }
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.stroke();
+    });
+    const x = selectedPoint < 0 ? NaN : pointScreen[2 * selectedPoint];
+    if (x === x) {
+      ctx.beginPath();
+      ctx.arc(x, pointScreen[2 * selectedPoint + 1], size + 5 * unit, 0, 2 * Math.PI);
+      ctx.lineWidth = 2 * unit;
+      ctx.strokeStyle = pointSelection;
+      ctx.stroke();
+    }
+  }
+
+  // Detections drawn within a fingertip of the pointer, nearest first.
+  function pointsAt(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const scale = canvas.width / rect.width;
+    const x = (clientX - rect.left) * scale;
+    const y = (clientY - rect.top) * scale;
+    const reach = 8 * scale;
+    const hits = [];
+    for (let i = 0; i < points.length; i++) {
+      const distance = Math.hypot(pointScreen[2 * i] - x, pointScreen[2 * i + 1] - y);
+      if (distance <= reach) hits.push([distance, points[i]]);
+    }
+    return hits.sort((a, b) => a[0] - b[0]).map(([, point]) => point);
   }
 
   // A regular octagon with flat sides, `apothem` from centre to each side.
@@ -157,19 +242,22 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
     ctx.fill();
   }
 
-  function drawGlobeCells(width, height, centerX, centerY, radius, sinLat, cosLat) {
+  function drawGlobeCells(width, height, centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing) {
     const sinLon = Math.sin(longitude * radians);
     const cosLon = Math.cos(longitude * radians);
     function project({ east, north, up }) {
       const forward = north * cosLon + east * sinLon;
+      const across = east * cosLon - north * sinLon;
+      const above = up * cosLat - forward * sinLat;
       return {
-        x: east * cosLon - north * sinLon,
-        y: up * cosLat - forward * sinLat,
+        x: across * cosBearing - above * sinBearing,
+        y: across * sinBearing + above * cosBearing,
         depth: up * sinLat + forward * cosLat,
       };
     }
     for (const { cell, corners, center } of cells) {
       if (dots) {
+        outlineDots();
         const { x, y, depth } = project(center);
         if (depth <= 0) continue;
         ctx.fillStyle = cell.color;
@@ -201,38 +289,6 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
     }
   }
 
-  function drawDetections(centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing) {
-    const sinLon = Math.sin(longitude * radians);
-    const cosLon = Math.cos(longitude * radians);
-    hitTargets = [];
-    for (const { row, point } of detections) {
-      const forward = point.north * cosLon + point.east * sinLon;
-      if (point.up * sinLat + forward * cosLat <= 0) continue;
-      const east = point.east * cosLon - point.north * sinLon;
-      const north = point.up * cosLat - forward * sinLat;
-      const x = centerX + radius * (east * cosBearing - north * sinBearing);
-      const y = centerY - radius * (east * sinBearing + north * cosBearing);
-      if (x < -5 || x > canvas.width + 5 || y < -5 || y > canvas.height + 5) continue;
-      hitTargets.push({ x, y, row });
-    }
-    ctx.strokeStyle = "#071522";
-    ctx.lineWidth = .8;
-    for (const modis of [true, false]) {
-      ctx.beginPath();
-      for (const { x, y, row } of hitTargets) {
-        if ((row.dataset === "modis") !== modis) continue;
-        if (modis) ctx.rect(x - 2, y - 2, 4, 4);
-        else {
-          ctx.moveTo(x + 2.3, y);
-          ctx.arc(x, y, 2.3, 0, Math.PI * 2);
-        }
-      }
-      ctx.stroke();
-      ctx.fillStyle = modis ? "#ffc273" : "#83e6f4";
-      ctx.fill();
-    }
-  }
-
   function cellAt(clientX, clientY) {
     if (!cellSize) return;
     const rect = canvas.getBoundingClientRect();
@@ -246,8 +302,10 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
       lon = longitude + x * degreesPerPixel;
     } else {
       const radius = globeRadius(rect.width, rect.height) * zoom;
-      const across = x / radius;
-      const up = y / radius;
+      const sinBearing = Math.sin(bearing * radians);
+      const cosBearing = Math.cos(bearing * radians);
+      const across = (x * cosBearing + y * sinBearing) / radius;
+      const up = (y * cosBearing - x * sinBearing) / radius;
       const depth = 1 - across * across - up * up;
       if (depth <= 0) return;
       const forward = Math.sqrt(depth);
@@ -284,6 +342,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
     const scale = Math.min(1, pixelLimit / Math.max(box.width, box.height));
     const width = Math.max(1, Math.round(box.width * scale));
     const height = Math.max(1, Math.round(box.height * scale));
+    unit = width / box.width;
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
@@ -311,9 +370,11 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
     }
     if (cells.length) {
       if (flat) drawFlatCells(width, height, centerX, centerY, worldWidth);
-      else drawGlobeCells(width, height, centerX, centerY, radius, sinLat, cosLat);
+      else drawGlobeCells(width, height, centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing);
     }
-    if (pilot) drawDetections(centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing);
+    if (points.length) {
+      drawPoints(width, height, centerX, centerY, radius, worldWidth, sinLat, cosLat, sinBearing, cosBearing);
+    }
     if (latitude !== reportedLatitude || longitude !== reportedLongitude) {
       reportedLatitude = latitude;
       reportedLongitude = longitude;
@@ -326,6 +387,18 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
     }
   }
 
+  function setCells(items, showDots) {
+    dots = showDots;
+    cellSize = items[0]?.size;
+    cellsByLocation = new Map(items.map((cell) => [`${cell.south},${cell.west}`, cell]));
+    cells = items.map((cell) => {
+      if (dots) return { cell, center: spherePoint(cell.latitude, cell.longitude) };
+      const corners = octagon(cell.south, cell.west, cell.size).map(([lat, lon]) => spherePoint(lat, lon));
+      return { cell, corners };
+    });
+    redraw();
+  }
+
   if (pilot) {
     new ResizeObserver(redraw).observe(canvas);
     return {
@@ -335,7 +408,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
         zoom = scale;
         bearing = heading;
         // Flight already updates inside an animation frame. Draw the Earth and
-        // detections before the spacecraft's new pose reaches the screen.
+        // its activity before the spacecraft's new pose reaches the screen.
         if (frame !== undefined) cancelAnimationFrame(frame);
         draw();
       },
@@ -347,26 +420,9 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
         if (!radius) return 0;
         return Math.asin(clamp((offsetY - height * globeCenterY) / radius, -.9, .9)) * degrees;
       },
-      setDetections(rows) {
-        detections = rows.map((row) => ({ row, point: spherePoint(row.latitude, row.longitude) }));
-        hitTargets = [];
-        redraw();
-      },
-      detectionAt(clientX, clientY) {
-        const rect = canvas.getBoundingClientRect();
-        const x = (clientX - rect.left) * canvas.width / rect.width;
-        const y = (clientY - rect.top) * canvas.height / rect.height;
-        let distance = 9 * canvas.width / rect.width;
-        let closest;
-        for (const hit of hitTargets) {
-          const next = Math.hypot(x - hit.x, y - hit.y);
-          if (next < distance) {
-            closest = hit.row;
-            distance = next;
-          }
-        }
-        return closest;
-      },
+      setCells,
+      getViewport,
+      cellAt,
     };
   }
 
@@ -467,8 +523,10 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
   canvas.addEventListener("pointerup", (event) => {
     if (!drag || drag.id !== event.pointerId) return;
     if (!drag.moved) {
-      const cell = cellAt(event.clientX, event.clientY);
-      if (cell) onSelect(cell);
+      const hits = pointsAt(event.clientX, event.clientY);
+      const cell = hits.length ? undefined : cellAt(event.clientX, event.clientY);
+      if (hits.length) onSelectPoints?.(hits);
+      else if (cell) onSelect(cell);
     }
     drag = undefined;
   });
@@ -526,7 +584,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
       const latSpan = bounds.max_lat - bounds.min_lat;
       longitude = wrap(bounds.min_lon + lonSpan / 2);
       latitude = (bounds.min_lat + bounds.max_lat) / 2;
-      zoom = Math.min(4, Math.max(1, 54 / Math.max(lonSpan, latSpan)));
+      zoom = lonSpan >= 359 ? 1.5 : Math.min(4, Math.max(1, 54 / Math.max(lonSpan, latSpan)));
       const box = canvas.parentElement.getBoundingClientRect();
       const worldWidth = flatMapWidth(box.width, box.height);
       flatZoom = worldWidth
@@ -534,15 +592,20 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
         : 1;
       redraw();
     },
-    setCells(items, showDots) {
-      dots = showDots;
-      cellSize = items[0]?.size;
-      cellsByLocation = new Map(items.map((cell) => [`${cell.south},${cell.west}`, cell]));
-      cells = items.map((cell) => {
-        if (dots) return { cell, center: spherePoint(cell.latitude, cell.longitude) };
-        const corners = octagon(cell.south, cell.west, cell.size).map(([lat, lon]) => spherePoint(lat, lon));
-        return { cell, corners };
+    setCells,
+    setPoints(items) {
+      points = items;
+      selectedPoint = -1;
+      pointScreen = new Float32Array(2 * items.length).fill(NaN);
+      pointVectors = new Float64Array(3 * items.length);
+      items.forEach((item, i) => {
+        const { east, north, up } = spherePoint(item.latitude, item.longitude);
+        pointVectors.set([east, north, up], 3 * i);
       });
+      redraw();
+    },
+    selectPoint(item) {
+      selectedPoint = points.indexOf(item);
       redraw();
     },
   };

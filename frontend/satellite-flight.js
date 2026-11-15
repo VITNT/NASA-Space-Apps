@@ -7,7 +7,6 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const wrap = (value, span) => ((value % span) + span) % span;
 const wrapLongitude = (value) => wrap(value + 180, 360) - 180;
 const start = { lat: 12.55, lon: 104.85, heading: 35 };
-const demoDate = "2025-03-08";
 // Flight feel, modelled on a small rigid body: speed is a share of cruise (1 =
 // cruise), and cruise covers the same distance on screen at every zoom.
 const flight = {
@@ -25,12 +24,6 @@ const flight = {
   turnS: .18,          // how quickly a turn starts and stops (s)
   gripS: .2,           // how long sideways drift survives a turn (s)
   zoomRate: 1.4,       // held zoom keys (per s, exponential)
-};
-const records = {
-  terra: { dataset: "modis", label: "Terra / MODIS" },
-  aqua: { dataset: "modis", label: "Aqua / MODIS" },
-  noaa20: { dataset: "viirs_noaa20", label: "NOAA-20 / VIIRS" },
-  snpp: { dataset: "viirs_snpp", label: "Suomi NPP / VIIRS" },
 };
 const keys = {
   KeyW: "forward", ArrowUp: "forward",
@@ -112,27 +105,12 @@ export function stepFlight(state, input, dt, zoom) {
   }
 }
 
-// Detections are loaded for the corridor between the craft and the view centre.
-function observationBounds({ lat, lon }, zoom, lead) {
-  const step = zoom >= 3.5 ? 2 : 8;
-  const margin = step * Math.max(1.5, Math.ceil(lead / 2 / step) + .5);
-  const centerLat = Math.round(lat / step) * step;
-  const centerLon = wrapLongitude(Math.round(lon / step) * step);
-  const width = margin / Math.max(.12, Math.cos(centerLat * radians));
-  const polar = Math.abs(centerLat) + margin >= 90;
-  return {
-    min_lat: Math.max(-90, centerLat - margin),
-    max_lat: Math.min(90, centerLat + margin),
-    min_lon: polar ? -180 : wrapLongitude(centerLon - width),
-    max_lon: polar ? 180 : wrapLongitude(centerLon + width),
-  };
-}
-
-export function createSatelliteFlight(root, api, onExit) {
+// `layer` supplies the activity the explore globe shows: a title for the current
+// selection, a query for a camera's view, and a description of a selected cell.
+export function createSatelliteFlight(root, layer, onExit) {
   const get = (id) => root.querySelector(`#${id}`);
   const canvas = get("flight-globe");
-  const date = get("flight-date");
-  const sensor = get("flight-sensor");
+  const selection = get("flight-selection");
   const dataStatus = get("flight-data-status");
   const detail = get("flight-detection");
   const position = get("flight-position");
@@ -157,10 +135,10 @@ export function createSatelliteFlight(root, api, onExit) {
   let frame;
   let active = false;
   let dirty = true;
-  let lastWindow;
+  let lastKey;
   let request;
   let timer;
-  const observationCache = new Map();
+  const cellCache = new Map();
   loadTerraModel(terraCanvas).then((loaded) => {
     if (!loaded) return;
     model = loaded;
@@ -190,11 +168,9 @@ export function createSatelliteFlight(root, api, onExit) {
     scheduleFrame();
   }
 
-  function showObservations({ rows, capped }) {
-    globe.setDetections(rows);
-    dataStatus.textContent = rows.length
-      ? `${rows.length.toLocaleString()} nearby detections loaded${capped ? " · limited result" : ""}`
-      : "No nearby detections in this selection.";
+  function showCells({ items, dots, label }) {
+    globe.setCells(items, dots);
+    dataStatus.textContent = items.length ? label : "No mapped observations in this view";
   }
 
   function clearInput() {
@@ -203,52 +179,46 @@ export function createSatelliteFlight(root, api, onExit) {
     for (const button of buttons) delete button.dataset.held;
   }
 
-  function clearObservations() {
+  function clearCells() {
     clearTimeout(timer);
+    timer = undefined;
     request?.abort();
-    lastWindow = undefined;
+    lastKey = undefined;
     detail.hidden = true;
-    globe.setDetections([]);
+    globe.setCells([], true);
   }
 
-  function refreshObservations(center, lead) {
-    if (!date.value || !date.validity.valid) {
-      dataStatus.textContent = "Choose a date in the archive.";
-      return;
-    }
-    const bounds = observationBounds(center, zoom, lead);
-    const day = date.value;
-    const filter = sensor.value;
-    const key = JSON.stringify({ bounds, day, filter });
-    if (key === lastWindow) return;
-    lastWindow = key;
-    clearTimeout(timer);
+  // Checked a few times a second while the view moves, like the explore globe.
+  function refreshCells() {
+    if (timer === undefined) timer = setTimeout(loadCells, 180);
+  }
+
+  async function loadCells() {
+    timer = undefined;
+    const camera = active && globe.getViewport();
+    if (!camera) return;
+    const { key, load } = layer.query(camera);
+    if (key === lastKey) return;
+    lastKey = key;
     request?.abort();
-    const cached = observationCache.get(key);
-    if (cached) {
-      observationCache.delete(key);
-      observationCache.set(key, cached);
-      showObservations(cached);
-      return;
-    }
-    dataStatus.textContent = "Loading nearby detections…";
-    timer = setTimeout(async () => {
-      const next = new AbortController();
-      request = next;
-      const platforms = filter ? [filter] : Object.keys(records);
-      try {
-        const pages = await Promise.all(platforms.map((platform) => api("/v1/hotspots", {
-          ...bounds, dataset: records[platform].dataset, platform, start_date: day, end_date: day, limit: 2500,
-        }, next.signal)));
+    const next = new AbortController();
+    request = next;
+    try {
+      let result = cellCache.get(key);
+      if (!result) {
+        dataStatus.textContent = "Loading map observations…";
+        result = await load(next.signal);
         if (!active || next.signal.aborted) return;
-        const result = { rows: pages.flatMap((page) => page.data), capped: pages.some((page) => page.truncated) };
-        observationCache.set(key, result);
-        if (observationCache.size > 8) observationCache.delete(observationCache.keys().next().value);
-        showObservations(result);
-      } catch (error) {
-        if (!next.signal.aborted) dataStatus.textContent = error.message;
       }
-    }, 85);
+      cellCache.delete(key);
+      cellCache.set(key, result);
+      if (cellCache.size > 6) cellCache.delete(cellCache.keys().next().value);
+      showCells(result);
+    } catch (error) {
+      if (next.signal.aborted) return;
+      lastKey = undefined;
+      dataStatus.textContent = error.message;
+    }
   }
 
   // Where the spacecraft is drawn, in pixels below the top of the globe canvas.
@@ -271,7 +241,7 @@ export function createSatelliteFlight(root, api, onExit) {
     heading.textContent = `${Math.round(state.heading) % 360}° ${compass[Math.round(state.heading / 45) % 8]}`;
     const speed = Math.round(100 * Math.abs(state.speed));
     speedReadout.textContent = `${speed}%${state.speed < 0 && speed ? " reverse" : ""}`;
-    refreshObservations(destination(state, state.heading, lead / 2), lead);
+    refreshCells();
   }
 
   function tick(time) {
@@ -314,24 +284,11 @@ export function createSatelliteFlight(root, api, onExit) {
     invalidate();
   }
 
-  function inspect(row) {
-    if (!row) {
-      detail.hidden = true;
-      return;
-    }
-    const timestamp = new Date(row.observation_time_utc);
-    const time = Number.isNaN(timestamp.getTime()) ? row.observation_time_utc : timestamp.toISOString().slice(11, 16) + " UTC";
-    const power = row.frp_mw == null ? "" : ` · ${row.frp_mw.toLocaleString()} MW FRP`;
-    detail.textContent = `${records[row.platform]?.label ?? row.platform} · ${time} · ${positionLabel({ lat: row.latitude, lon: row.longitude })} · ${row.confidence_class} confidence${power}`;
-    detail.hidden = false;
+  function inspect(cell) {
+    detail.hidden = !cell;
+    if (cell) detail.textContent = layer.describe(cell);
   }
 
-  function updateSelection() {
-    clearObservations();
-    invalidate();
-  }
-
-  for (const input of [date, sensor]) input.addEventListener("change", updateSelection);
   get("flight-reset").addEventListener("click", reset);
   get("flight-exit").addEventListener("click", onExit);
   get("flight-zoom-in").addEventListener("click", () => changeZoom(1.35));
@@ -349,7 +306,7 @@ export function createSatelliteFlight(root, api, onExit) {
   canvas.addEventListener("pointerup", (event) => {
     if (markerPress?.id !== event.pointerId) return;
     if (Math.hypot(event.clientX - markerPress.x, event.clientY - markerPress.y) < 5) {
-      inspect(globe.detectionAt(event.clientX, event.clientY));
+      inspect(globe.cellAt(event.clientX, event.clientY));
     }
     markerPress = undefined;
   });
@@ -422,16 +379,13 @@ export function createSatelliteFlight(root, api, onExit) {
   });
 
   return {
-    setDateLimits(first, last) {
-      date.min = first;
-      date.max = last;
-      if (date.value < first || date.value > last) date.value = demoDate >= first && demoDate <= last ? demoDate : last;
-      updateSelection();
-    },
     start() {
       if (active) return;
       active = true;
       previousTime = undefined;
+      // The selection can change whenever flight is off.
+      cellCache.clear();
+      selection.textContent = layer.title();
       measure();
       reset();
       canvas.focus({ preventScroll: true });
@@ -441,7 +395,7 @@ export function createSatelliteFlight(root, api, onExit) {
       cancelAnimationFrame(frame);
       frame = undefined;
       clearInput();
-      clearObservations();
+      clearCells();
     },
   };
 }

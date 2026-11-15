@@ -1,5 +1,10 @@
 export const wrapLongitude = (longitude) => ((longitude + 180) % 360 + 360) % 360 - 180;
 
+// Individual detections are red, and brighter the more fire radiative power they carry.
+export const pointColors = ["#f0281c", "#ff7a1c", "#ffd23c"];
+export const pointOutline = "rgba(22, 5, 2, .85)";
+export const pointSelection = "#ffe600";
+
 export function cameraBounds(lat, lon, latitudeRadius, longitudeRadius) {
   return [
     Math.max(-90, lat - latitudeRadius), Math.min(90, lat + latitudeRadius),

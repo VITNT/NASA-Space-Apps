@@ -126,6 +126,64 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(shared_left, shared_right)
         self.assertTrue(all(row["observed_days"] <= 2 for row in shared_left))
 
+    def test_hotspot_export_is_complete_and_matches_its_count(self) -> None:
+        params = dict(start_date="2025-02-01", end_date="2025-02-28",
+                      min_lat=10.35, max_lat=14.8, min_lon=102.3, max_lon=107.75)
+        count = self.client.get("/v1/export/hotspots/count", params=params).json()
+        response = self.client.get("/v1/export/hotspots.csv", params=params)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("attachment", response.headers["content-disposition"])
+        lines = response.text.splitlines()
+        self.assertEqual(len(lines) - 1, count["count"])
+        self.assertGreater(count["count"], 15_000)  # more than the old 5,000-per-sensor cap
+        header = lines[0].split(",")
+        self.assertIn("counts_toward_calendar", header)
+        flags = [line.split(",")[header.index("counts_toward_calendar")] for line in lines[1:]]
+        self.assertEqual(flags.count("yes"), count["qualifying"])
+
+    def test_hotspot_export_honors_selected_days(self) -> None:
+        response = self.client.get("/v1/export/hotspots.csv", params=dict(
+            start_date="2025-02-03", end_date="2025-02-07", days=["2025-02-03", "2025-02-07"],
+            min_lat=10.35, max_lat=14.8, min_lon=102.3, max_lon=107.75))
+        self.assertEqual({line.split(",")[0] for line in response.text.splitlines()[1:]}, {"2025-02-03", "2025-02-07"})
+
+    def test_hotspot_export_refuses_rather_than_truncates(self) -> None:
+        response = self.client.get("/v1/export/hotspots.csv", params=dict(
+            start_date="2025-02-01", end_date="2025-02-28", min_lat=-90, max_lat=90, min_lon=-180, max_lon=180))
+        self.assertEqual(response.status_code, 413)
+
+    def test_daily_coverage_lists_reporting_platforms(self) -> None:
+        rows = self.client.get("/v1/coverage/daily", params=dict(
+            start_date="2025-02-01", end_date="2025-02-01")).json()["data"]
+        self.assertEqual({row["platform"] for row in rows}, {"terra", "aqua", "snpp", "noaa20"})
+
+    def test_map_points_return_each_detection_in_the_viewport(self) -> None:
+        params = dict(
+            dataset="viirs_noaa20", start_date="2025-11-13", end_date="2025-11-13",
+            min_lat=-90, max_lat=90, min_lon=-180, max_lon=180, viewport=[10, 15, 102, 108],
+        )
+        points = self.client.get("/v1/spatial/points", params=params)
+        grid = self.client.get("/v1/spatial/grid", params={**params, "cell_size": 1})
+        self.assertEqual(points.status_code, 200)
+        body = points.json()
+        self.assertFalse(body["truncated"])
+        rows = [dict(zip(body["columns"], row)) for row in body["rows"]]
+        self.assertEqual(len(rows), sum(cell["detection_count"] for cell in grid.json()["data"]))
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertTrue(10 <= row["latitude"] < 15 and 102 <= row["longitude"] < 108)
+            self.assertEqual(row["platform"], "noaa20")
+            self.assertTrue(row["observed_utc"].startswith("2025-11-13T"))
+            self.assertIn(row["daynight"], ("D", "N"))
+
+    def test_map_points_report_a_view_with_too_many_detections(self) -> None:
+        body = self.client.get("/v1/spatial/points", params=dict(
+            start_date="2025-02-01", end_date="2025-02-28",
+            min_lat=-90, max_lat=90, min_lon=-180, max_lon=180,
+        )).json()
+        self.assertTrue(body["truncated"])
+        self.assertEqual(body["rows"], [])
+
     def test_grid_rejects_a_worldwide_detail_request(self) -> None:
         response = self.client.get("/v1/spatial/grid", params=dict(
             start_date="2025-11-13", end_date="2025-11-13",

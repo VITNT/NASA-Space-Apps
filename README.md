@@ -83,7 +83,7 @@ local launches, link the extracted archive once from the project directory:
 
 ```sh
 mkdir -p .local
-ln -s "$HOME/Downloads/burnline-data" .local/archive
+ln -s "$HOME/Downloads/luminite-data" .local/archive
 ```
 
 An explicit `FIRMS_PROJECT_ROOT` takes precedence over the saved local link.
@@ -120,6 +120,8 @@ produced by Reto Stöckli. Google Sans Flex is bundled with its SIL Open Font Li
 
 Data citations, product documentation, software acknowledgements, and a
 ready-to-use attribution paragraph are provided in [REFERENCES.md](REFERENCES.md).
+
+For Docker hosting on a VM, see [Deploy Luminite](DEPLOYMENT.md).
 
 ## Current inputs
 

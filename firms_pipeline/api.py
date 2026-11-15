@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import shlex
@@ -13,7 +15,8 @@ from typing import Annotated, Any, Iterator, Literal
 
 import duckdb
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -33,6 +36,46 @@ Platform = Literal["aqua", "terra", "noaa20", "snpp"]
 ConfidenceClass = Literal["low", "nominal", "high"]
 DayNight = Literal["D", "N"]
 MAP_CELL_SIZES = tuple(2.0 ** exponent for exponent in range(-8, 2))
+MAP_POINT_LIMIT = 50_000
+MAP_POINT_COLUMNS = (
+    "latitude", "longitude", "observed_utc", "dataset", "platform", "frp_mw",
+    "brightness_primary_k", "brightness_secondary_k", "scan_km", "track_km",
+    "daynight", "confidence_raw", "confidence_class", "hotspot_type",
+    "product_version", "source_stage",
+)
+# The hotspot export is complete or refused, never cut short.
+EXPORT_LIMIT = 500_000
+# One row per detection, labelled for people as well as programs. Brightness
+# channels are named by spectral role because MODIS and VIIRS use different bands.
+EXPORT_FIELDS = (
+    ("acq_date", "strftime(acq_date, '%Y-%m-%d')"),
+    ("acq_time_utc", "strftime(observation_time_utc, '%H:%M')"),
+    ("latitude", "latitude"),
+    ("longitude", "longitude"),
+    ("satellite", "CASE platform WHEN 'terra' THEN 'Terra' WHEN 'aqua' THEN 'Aqua' "
+                  "WHEN 'snpp' THEN 'Suomi NPP' WHEN 'noaa20' THEN 'NOAA-20' ELSE platform END"),
+    ("instrument", "upper(instrument_family)"),
+    ("dataset", "dataset"),
+    ("nominal_pixel_m", "CASE WHEN dataset = 'modis' THEN 1000 ELSE 375 END"),
+    ("scan_km", "scan_km"),
+    ("track_km", "track_km"),
+    ("day_night", "CASE daynight WHEN 'D' THEN 'day' WHEN 'N' THEN 'night' END"),
+    ("confidence_class", "confidence_class"),
+    ("confidence_raw", "confidence_raw"),
+    ("frp_mw", "frp_mw"),
+    ("brightness_mir_k", "brightness_primary_k"),
+    ("brightness_tir_k", "brightness_secondary_k"),
+    ("hotspot_type", "hotspot_type"),
+    ("hotspot_type_label", "CASE hotspot_type WHEN 0 THEN 'presumed vegetation fire' WHEN 1 THEN 'active volcano' "
+                           "WHEN 2 THEN 'other static land source' WHEN 3 THEN 'offshore' ELSE 'not yet classified' END"),
+    ("counts_toward_calendar", f"CASE WHEN {CELL_DAY_FILTER} THEN 'yes' ELSE 'no' END"),
+    ("calendar_cell_lat", f"round({CELL_Y_SQL} / 10, 1)"),
+    ("calendar_cell_lon", f"round(({CELL_X_SQL}) / 10, 1)"),
+    ("product_version", "product_version"),
+    ("source_stage", "source_stage"),
+)
+EXPORT_COLUMNS = tuple(name for name, _ in EXPORT_FIELDS)
+EXPORT_SQL = ", ".join(f"{sql} AS {name}" for name, sql in EXPORT_FIELDS)
 GLOBAL_HISTORY = Path(__file__).with_name("resources") / "global_history.json"
 MAPS_KEY_ENV = "FIRMS_GOOGLE_MAPS_BROWSER_KEY"
 
@@ -171,6 +214,55 @@ def _bbox_clause(min_lon: float, max_lon: float) -> tuple[str, list[float]]:
     return "(longitude >= ? OR longitude <= ?)", [min_lon, max_lon]
 
 
+def _map_conditions(
+    start_date: date, end_date: date,
+    min_lat: float, max_lat: float, min_lon: float, max_lon: float,
+    dataset: str | None, days: list[date] | None, viewport: list[float] | None,
+) -> tuple[list[str], list[Any]]:
+    """The detections a map request covers: area, dates, sensor and viewport."""
+    longitude_sql, longitude_parameters = _bbox_clause(min_lon, max_lon)
+    conditions = [
+        "year BETWEEN ? AND ?", "acq_date BETWEEN ? AND ?",
+        "latitude BETWEEN ? AND ?", longitude_sql,
+    ]
+    parameters: list[Any] = [start_date.year, end_date.year, start_date, end_date, min_lat, max_lat, *longitude_parameters]
+    if start_date.year == end_date.year:
+        conditions.append("month BETWEEN ? AND ?")
+        parameters.extend([start_date.month, end_date.month])
+    if dataset is not None:
+        conditions.append("dataset = ?")
+        parameters.append(dataset)
+    if days:
+        conditions.append("acq_date IN (SELECT unnest(?::DATE[]))")
+        parameters.append(days)
+    if viewport:
+        south, north, west, east = viewport
+        # Viewport edges fall between cells. Keep the lower edge inclusive
+        # so panning never changes the observations counted in a given cell.
+        longitude = "(CASE WHEN longitude = 180 THEN -180 ELSE longitude END)"
+        join = "AND" if west <= east else "OR"
+        conditions.extend([
+            "latitude >= ?",
+            "latitude <= ?" if north == 90 else "latitude < ?",
+            f"({longitude} >= ? {join} {longitude} < ?)",
+        ])
+        parameters.extend([south, north, west, east])
+    return conditions, parameters
+
+
+class RevalidatedStaticFiles(StaticFiles):
+    """Frontend files that browsers recheck on every load.
+
+    The scripts import each other by plain path, so a browser that kept one
+    stale module beside fresh ones would fail to start the page.
+    """
+
+    def file_response(self, *args: Any, **kwargs: Any):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def _repository(request: Request) -> DataRepository:
     return request.app.state.repository
 
@@ -202,10 +294,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "MODIS and VIIRS remain separately identified."
         ),
     )
+    app.add_middleware(GZipMiddleware, minimum_size=4096)
     app.state.repository = repository
     frontend_root = Path(__file__).resolve().parents[1] / "frontend"
     if frontend_root.exists():
-        app.mount("/static", StaticFiles(directory=frontend_root), name="static")
+        app.mount("/static", RevalidatedStaticFiles(directory=frontend_root), name="static")
 
         @app.get("/", include_in_schema=False)
         def frontend() -> FileResponse:
@@ -274,11 +367,108 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         repo = _repository(request)
         data = repo.rows(f"""
             SELECT month_start, dataset, platform, is_complete_month,
-                active_days = calendar_days AS platform_complete
+                active_days = calendar_days AS platform_complete,
+                active_days, calendar_days
             FROM {repo.monthly}
             ORDER BY month_start, dataset, platform
         """)
         return ResultPage(data=data, count=len(data))
+
+    @app.get("/v1/coverage/daily", response_model=ResultPage)
+    def daily_coverage(request: Request, start_date: date, end_date: date) -> ResultPage:
+        """The UTC days on which each platform reported anywhere on Earth.
+
+        A working satellite detects fires somewhere every day, so a platform
+        missing from a day had no data that day, not merely no fire.
+        """
+        _date_span(start_date, end_date, 366)
+        repo = _repository(request)
+        data = repo.rows(f"""
+            SELECT DISTINCT activity_date AS date, dataset, platform
+            FROM {repo.daily}
+            WHERE activity_date BETWEEN ? AND ?
+            ORDER BY date, dataset, platform
+        """, [start_date, end_date])
+        return ResultPage(data=data, count=len(data))
+
+    def export_query(
+        repo: DataRepository, start_date: date, end_date: date,
+        min_lat: float, max_lat: float, min_lon: float, max_lon: float,
+        dataset: str | None, days: list[date] | None,
+    ) -> tuple[str, list[Any]]:
+        _date_span(start_date, end_date, 31)
+        if max_lat < min_lat:
+            raise HTTPException(status_code=422, detail="Invalid latitude bounds")
+        if days and any(day < start_date or day > end_date for day in days):
+            raise HTTPException(status_code=422, detail="Selected days must be within the date range")
+        conditions, parameters = _map_conditions(
+            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, None)
+        return f"FROM {repo.points} WHERE {' AND '.join(conditions)}", parameters
+
+    @app.get("/v1/export/hotspots/count")
+    def export_hotspot_count(
+        request: Request,
+        start_date: date,
+        end_date: date,
+        min_lat: Annotated[float, Query(ge=-90, le=90)],
+        max_lat: Annotated[float, Query(ge=-90, le=90)],
+        min_lon: Annotated[float, Query(ge=-180, le=180)],
+        max_lon: Annotated[float, Query(ge=-180, le=180)],
+        dataset: Dataset | None = None,
+        days: Annotated[list[date] | None, Query(max_length=31)] = None,
+    ) -> dict[str, Any]:
+        repo = _repository(request)
+        source, parameters = export_query(repo, start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days)
+        count, qualifying = repo.rows(
+            f"SELECT count(*) AS n, count_if({CELL_DAY_FILTER}) AS q {source}", parameters)[0].values()
+        return {"count": count, "qualifying": qualifying, "limit": EXPORT_LIMIT}
+
+    @app.get("/v1/export/hotspots.csv")
+    def export_hotspots(
+        request: Request,
+        start_date: date,
+        end_date: date,
+        min_lat: Annotated[float, Query(ge=-90, le=90)],
+        max_lat: Annotated[float, Query(ge=-90, le=90)],
+        min_lon: Annotated[float, Query(ge=-180, le=180)],
+        max_lon: Annotated[float, Query(ge=-180, le=180)],
+        dataset: Dataset | None = None,
+        days: Annotated[list[date] | None, Query(max_length=31)] = None,
+    ) -> StreamingResponse:
+        """Every detection in the search, one row each, streamed as CSV.
+
+        Unlike /v1/hotspots this export is never silently truncated: a search
+        larger than EXPORT_LIMIT is refused so the file is always complete.
+        """
+        repo = _repository(request)
+        source, parameters = export_query(repo, start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days)
+        count = repo.rows(f"SELECT count(*) AS n {source}", parameters)[0]["n"]
+        if count > EXPORT_LIMIT:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{count:,} detections exceed the {EXPORT_LIMIT:,}-row export limit. "
+                "Narrow the area or choose fewer days.",
+            )
+        query = f"SELECT {EXPORT_SQL} {source} ORDER BY observation_time_utc, dataset, platform, latitude, longitude"
+
+        def rows() -> Iterator[str]:
+            buffer = io.StringIO()
+            writer = csv.writer(buffer, lineterminator="\r\n")
+            writer.writerow(EXPORT_COLUMNS)
+            with repo.connection() as connection:
+                cursor = connection.execute(query, parameters)
+                while batch := cursor.fetchmany(20_000):
+                    writer.writerows(batch)
+                    yield buffer.getvalue()
+                    buffer.seek(0)
+                    buffer.truncate()
+            yield buffer.getvalue()
+
+        name = f"luminite-hotspots-{start_date.isoformat()}_{end_date.isoformat()}.csv"
+        return StreamingResponse(rows(), media_type="text/csv; charset=utf-8", headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "X-Row-Count": str(count),
+        })
 
     @app.get("/v1/calendar", response_model=ResultPage)
     def burning_calendar(
@@ -438,34 +628,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if (latitude_span / cell_size + 1) * (longitude_span / cell_size + 1) > 70_000:
             raise HTTPException(status_code=422, detail="Map viewport is too large for this cell size")
         repo = _repository(request)
-        longitude_sql, longitude_parameters = _bbox_clause(min_lon, max_lon)
-        conditions = [
-            "year BETWEEN ? AND ?", "acq_date BETWEEN ? AND ?",
-            "latitude BETWEEN ? AND ?", longitude_sql,
-        ]
-        parameters: list[Any] = [start_date.year, end_date.year, start_date, end_date, min_lat, max_lat, *longitude_parameters]
-        if start_date.year == end_date.year:
-            conditions.append("month BETWEEN ? AND ?")
-            parameters.extend([start_date.month, end_date.month])
-        if dataset is not None:
-            conditions.append("dataset = ?")
-            parameters.append(dataset)
-        if days:
-            conditions.append("acq_date IN (SELECT unnest(?::DATE[]))")
-            parameters.append(days)
-        if viewport:
-            if any(bound % cell_size for bound in viewport):
-                raise HTTPException(status_code=422, detail="Map viewport must align to grid cells")
-            # Viewport edges fall between cells. Keep the lower edge inclusive
-            # so panning never changes the observations counted in a given cell.
-            longitude = "(CASE WHEN longitude = 180 THEN -180 ELSE longitude END)"
-            join = "AND" if west <= east else "OR"
-            conditions.extend([
-                "latitude >= ?",
-                "latitude <= ?" if north == 90 else "latitude < ?",
-                f"({longitude} >= ? {join} {longitude} < ?)",
-            ])
-            parameters.extend([south, north, west, east])
+        if viewport and any(bound % cell_size for bound in viewport):
+            raise HTTPException(status_code=422, detail="Map viewport must align to grid cells")
+        conditions, parameters = _map_conditions(
+            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, viewport)
 
         data = repo.rows(f"""
             WITH observations AS (
@@ -484,6 +650,52 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             GROUP BY x, y ORDER BY y, x
         """, parameters)
         return MapGrid(data=data, cell_size=cell_size)
+
+    @app.get("/v1/spatial/points")
+    def map_points(
+        request: Request,
+        start_date: date,
+        end_date: date,
+        min_lat: Annotated[float, Query(ge=-90, le=90)],
+        max_lat: Annotated[float, Query(ge=-90, le=90)],
+        min_lon: Annotated[float, Query(ge=-180, le=180)],
+        max_lon: Annotated[float, Query(ge=-180, le=180)],
+        dataset: Dataset | None = None,
+        days: Annotated[list[date] | None, Query(max_length=31)] = None,
+        viewport: Annotated[list[float] | None, Query(min_length=4, max_length=4)] = None,
+    ) -> JSONResponse:
+        """Individual detections for the map, as rows of MAP_POINT_COLUMNS.
+
+        A view holding more than MAP_POINT_LIMIT detections is reported as
+        truncated; the map then shows the grouped grid instead.
+        """
+        _date_span(start_date, end_date, 31)
+        if max_lat < min_lat:
+            raise HTTPException(status_code=422, detail="Invalid latitude bounds")
+        if days and any(day < start_date or day > end_date for day in days):
+            raise HTTPException(status_code=422, detail="Selected days must be within the date range")
+        if viewport:
+            south, north, west, east = viewport
+            if not (-90 <= south <= north <= 90 and -180 <= west <= 180 and -180 <= east <= 180):
+                raise HTTPException(status_code=422, detail="Invalid map viewport bounds")
+        repo = _repository(request)
+        conditions, parameters = _map_conditions(
+            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, viewport)
+        columns = ", ".join(
+            "strftime(observation_time_utc, '%Y-%m-%dT%H:%M:%SZ')" if name == "observed_utc" else name
+            for name in MAP_POINT_COLUMNS
+        )
+        with repo.connection() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM {repo.points} WHERE {' AND '.join(conditions)} LIMIT ?",
+                [*parameters, MAP_POINT_LIMIT + 1],
+            ).fetchall()
+        truncated = len(rows) > MAP_POINT_LIMIT
+        return JSONResponse({
+            "columns": MAP_POINT_COLUMNS,
+            "rows": [] if truncated else rows,
+            "truncated": truncated,
+        })
 
     @app.get("/v1/activity/monthly", response_model=ResultPage)
     def monthly_activity(
