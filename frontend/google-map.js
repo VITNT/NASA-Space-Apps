@@ -1,5 +1,5 @@
 import { bindMapZoom } from "./map-zoom.js";
-import { cameraBounds, octagon } from "./map-detail.js";
+import { cameraBounds } from "./map-detail.js";
 
 let loader;
 const minZoomRange = 50;
@@ -10,7 +10,7 @@ function loadMaps(key) {
   if (loader) return loader;
   loader = new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    const callback = "burnlineGoogleMapsReady";
+    const callback = "luminiteGoogleMapsReady";
     let settled = false;
     function finish(error) {
       if (settled) return;
@@ -51,7 +51,7 @@ function cameraFor(bounds, aspect) {
 
 export async function createGoogleMap(host, key, bounds, onSelect, onMove, onError, onViewportChange) {
   const maps = await loadMaps(key);
-  const { Map3DElement, Polygon3DInteractiveElement } = await maps.importLibrary("maps3d");
+  const { Map3DElement, Marker3DInteractiveElement } = await maps.importLibrary("maps3d");
   const camera = (area) => cameraFor(area, host.clientWidth / Math.max(1, host.clientHeight));
   const map = new Map3DElement({
     ...camera(bounds),
@@ -61,7 +61,7 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
     defaultUIHidden: true,
     minAltitude: minZoomRange,
     maxAltitude: maxZoomRange,
-    description: "Google 3D Earth with FIRMS detection grid cells. Drag to move, or pinch or scroll to zoom.",
+    description: "Google 3D Earth with FIRMS activity pins. Drag to move, or pinch or scroll to zoom.",
   });
 
   function changeZoom(factor) {
@@ -79,25 +79,19 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
   };
   map.addEventListener("gmp-centerchange", reportCenter);
 
-  // Each polygon is a DOM element. Limit large selections to the busiest cells near the camera.
+  // Limit large selections to the busiest activity groups near the camera.
   let ranked = [];
   let shown = new Map();
   let cellTimer;
-  let dots;
-  function polygonFor(cell) {
-    const polygon = new Polygon3DInteractiveElement({
-      path: dots ? Array.from({ length: 8 }, (_, i) => {
-        const angle = i * Math.PI / 4;
-        const radius = cell.size * (.2 + .2 * cell.strength);
-        return { lat: cell.south + cell.size / 2 + radius * Math.sin(angle),
-          lng: cell.west + cell.size / 2 + radius * Math.cos(angle) };
-      }) : octagon(cell.south, cell.west, cell.size).map(([lat, lng]) => ({ lat, lng })),
+  function markerFor(cell) {
+    const marker = new Marker3DInteractiveElement({
+      position: { lat: cell.latitude, lng: cell.longitude },
       altitudeMode: "CLAMP_TO_GROUND",
-      fillColor: cell.color,
-      strokeWidth: 0,
+      collisionBehavior: "OPTIONAL_AND_HIDES_LOWER_PRIORITY",
+      collisionPriority: cell.detection_count,
     });
-    polygon.addEventListener("gmp-click", () => onSelect(cell));
-    return polygon;
+    marker.addEventListener("gmp-click", () => onSelect(cell));
+    return marker;
   }
   function showNearbyCells() {
     clearTimeout(cellTimer);
@@ -113,12 +107,12 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
         const lng = (((item.longitude - center.lng) % 360 + 540) % 360 - 180) * stretch;
         if (lat * lat + lng * lng > radius * radius) continue;
       }
-      next.set(item, shown.get(item) ?? polygonFor(item));
+      next.set(item, shown.get(item) ?? markerFor(item));
       if (next.size === maxCells) break;
     }
-    for (const [item, polygon] of shown) if (!next.has(item)) polygon.remove();
+    for (const [item, marker] of shown) if (!next.has(item)) marker.remove();
     const added = document.createDocumentFragment();
-    for (const [item, polygon] of next) if (!shown.has(item)) added.append(polygon);
+    for (const [item, marker] of next) if (!shown.has(item)) added.append(marker);
     map.append(added);
     shown = next;
   }
@@ -171,12 +165,7 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
       Object.assign(map, camera(area));
       reportCenter();
     },
-    setCells(items, showDots) {
-      if (dots !== showDots) {
-        for (const polygon of shown.values()) polygon.remove();
-        shown.clear();
-      }
-      dots = showDots;
+    setCells(items) {
       ranked = [...items].sort((a, b) => b.detection_count - a.detection_count);
       showNearbyCells();
     },

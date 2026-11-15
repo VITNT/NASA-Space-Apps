@@ -10,6 +10,7 @@ precision highp float;
 uniform vec2 center;
 uniform float radius;
 uniform vec2 latitude;
+uniform vec2 bearing;
 uniform float longitude;
 uniform sampler2D earth;
 
@@ -19,8 +20,10 @@ void main() {
   if (depth <= 0.0) discard;
 
   float z = sqrt(depth);
-  float angle = atan(p.x, z * latitude.y - p.y * latitude.x);
-  float phi = asin(clamp(p.y * latitude.y + z * latitude.x, -1.0, 1.0));
+  float east = p.x * bearing.y + p.y * bearing.x;
+  float north = p.y * bearing.y - p.x * bearing.x;
+  float angle = atan(east, z * latitude.y - north * latitude.x);
+  float phi = asin(clamp(north * latitude.y + z * latitude.x, -1.0, 1.0));
   vec2 uv = vec2(0.5 + longitude + angle / 6.283185307, 0.5 - phi / 3.141592654);
   vec3 color = texture2D(earth, uv).rgb;
   float light = 0.32 + 0.58 * max(0.0, dot(vec3(p, z), vec3(-0.48, 0.42, 0.77)));
@@ -78,6 +81,7 @@ export function createEarthRenderer(canvas) {
   const radiusLocation = gl.getUniformLocation(program, "radius");
   const latitudeLocation = gl.getUniformLocation(program, "latitude");
   const longitudeLocation = gl.getUniformLocation(program, "longitude");
+  const bearingLocation = gl.getUniformLocation(program, "bearing");
 
   return {
     setImage(image) {
@@ -88,7 +92,7 @@ export function createEarthRenderer(canvas) {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
       return true;
     },
-    draw(width, height, radius, centerX, centerY, sinLat, cosLat, longitude) {
+    draw(width, height, radius, centerX, centerY, sinLat, cosLat, longitude, sinBearing, cosBearing) {
       if (canvas.width !== width) canvas.width = width;
       if (canvas.height !== height) canvas.height = height;
       gl.viewport(0, 0, width, height);
@@ -96,6 +100,7 @@ export function createEarthRenderer(canvas) {
       gl.uniform2f(centerLocation, centerX, height - centerY);
       gl.uniform1f(radiusLocation, radius);
       gl.uniform2f(latitudeLocation, sinLat, cosLat);
+      gl.uniform2f(bearingLocation, sinBearing, cosBearing);
       gl.uniform1f(longitudeLocation, longitude / 360);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     },

@@ -1,4 +1,4 @@
-"""Start Burnline on a Hugging Face Space.
+"""Start Luminite on a Hugging Face Space.
 
 The Space has no permanent disk, so the Parquet products are downloaded from the
 dataset named in FIRMS_DATASET_REPO each time the Space starts, then served.

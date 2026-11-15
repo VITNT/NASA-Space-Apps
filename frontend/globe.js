@@ -13,10 +13,10 @@ const flatZoomMin = 1;
 const flatZoomMax = 48;
 const maxZoomTurn = 3;
 
-export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
+export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot = false } = {}) {
   const ctx = canvas.getContext("2d");
   const earthCanvas = document.createElement("canvas");
-  earthCanvas.id = "globe-earth";
+  earthCanvas.id = `${canvas.id}-earth`;
   earthCanvas.setAttribute("aria-hidden", "true");
   canvas.before(earthCanvas);
   let renderer = createEarthRenderer(earthCanvas);
@@ -26,6 +26,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
   let longitude = 104.8;
   let latitude = 17;
   let zoom = 1;
+  let bearing = 0;
   let flatZoom = 1;
   let flat = false;
   let steeringRemaining = 0;
@@ -41,6 +42,8 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
   let reportedLatitude;
   let reportedLongitude;
   let reportedViewport;
+  let detections = [];
+  let hitTargets = [];
 
   function loadFallbackImage() {
     if (!earth.naturalWidth || source) return;
@@ -70,7 +73,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
     if (frame === undefined) frame = requestAnimationFrame(() => draw());
   }
 
-  function drawEarth(width, height, radius, centerX, centerY, sinLat, cosLat) {
+  function drawEarth(width, height, radius, centerX, centerY, sinLat, cosLat, sinBearing, cosBearing) {
     const image = ctx.createImageData(width, height);
     const output = image.data;
     const input = source?.data;
@@ -84,9 +87,11 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
         const z = Math.sqrt(depth);
         const light = .32 + .58 * Math.max(0, -.48 * x + .42 * y + .77 * z);
         const index = (py * width + px) * 4;
-        const u = Math.atan2(x, z * cosLat - y * sinLat) * degrees;
+        const east = x * cosBearing + y * sinBearing;
+        const north = y * cosBearing - x * sinBearing;
+        const u = Math.atan2(east, z * cosLat - north * sinLat) * degrees;
         const lon = wrap(longitude + u);
-        const lat = Math.asin(y * cosLat + z * sinLat) * degrees;
+        const lat = Math.asin(clamp(north * cosLat + z * sinLat, -1, 1)) * degrees;
         const sx = Math.floor((lon + 180) / 360 * texture.width);
         const sy = Math.min(texture.height - 1, Math.floor((90 - lat) / 180 * texture.height));
         const sample = (sy * texture.width + sx) * 4;
@@ -196,6 +201,38 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
     }
   }
 
+  function drawDetections(centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing) {
+    const sinLon = Math.sin(longitude * radians);
+    const cosLon = Math.cos(longitude * radians);
+    hitTargets = [];
+    for (const { row, point } of detections) {
+      const forward = point.north * cosLon + point.east * sinLon;
+      if (point.up * sinLat + forward * cosLat <= 0) continue;
+      const east = point.east * cosLon - point.north * sinLon;
+      const north = point.up * cosLat - forward * sinLat;
+      const x = centerX + radius * (east * cosBearing - north * sinBearing);
+      const y = centerY - radius * (east * sinBearing + north * cosBearing);
+      if (x < -5 || x > canvas.width + 5 || y < -5 || y > canvas.height + 5) continue;
+      hitTargets.push({ x, y, row });
+    }
+    ctx.strokeStyle = "#071522";
+    ctx.lineWidth = .8;
+    for (const modis of [true, false]) {
+      ctx.beginPath();
+      for (const { x, y, row } of hitTargets) {
+        if ((row.dataset === "modis") !== modis) continue;
+        if (modis) ctx.rect(x - 2, y - 2, 4, 4);
+        else {
+          ctx.moveTo(x + 2.3, y);
+          ctx.arc(x, y, 2.3, 0, Math.PI * 2);
+        }
+      }
+      ctx.stroke();
+      ctx.fillStyle = modis ? "#ffc273" : "#83e6f4";
+      ctx.fill();
+    }
+  }
+
   function cellAt(clientX, clientY) {
     if (!cellSize) return;
     const rect = canvas.getBoundingClientRect();
@@ -257,15 +294,17 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
     const worldWidth = flatMapWidth(width, height) * flatZoom;
     const sinLat = Math.sin(latitude * radians);
     const cosLat = Math.cos(latitude * radians);
-    const key = [width, height, zoom, latitude, longitude].join(",");
+    const sinBearing = Math.sin(bearing * radians);
+    const cosBearing = Math.cos(bearing * radians);
+    const key = [width, height, zoom, latitude, longitude, bearing].join(",");
     if (flat) {
       drawFlatMap(width, height, centerX, centerY, worldWidth);
     } else if (renderer) {
-      renderer.draw(width, height, radius, centerX, centerY, sinLat, cosLat, longitude);
+      renderer.draw(width, height, radius, centerX, centerY, sinLat, cosLat, longitude, sinBearing, cosBearing);
       ctx.clearRect(0, 0, width, height);
     } else {
       if (geometry !== key) {
-        base = drawEarth(width, height, radius, centerX, centerY, sinLat, cosLat);
+        base = drawEarth(width, height, radius, centerX, centerY, sinLat, cosLat, sinBearing, cosBearing);
         geometry = key;
       }
       ctx.putImageData(base, 0, 0);
@@ -274,6 +313,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
       if (flat) drawFlatCells(width, height, centerX, centerY, worldWidth);
       else drawGlobeCells(width, height, centerX, centerY, radius, sinLat, cosLat);
     }
+    if (pilot) drawDetections(centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing);
     if (latitude !== reportedLatitude || longitude !== reportedLongitude) {
       reportedLatitude = latitude;
       reportedLongitude = longitude;
@@ -284,6 +324,50 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
       reportedViewport = viewport;
       onViewportChange();
     }
+  }
+
+  if (pilot) {
+    new ResizeObserver(redraw).observe(canvas);
+    return {
+      setCamera(lat, lon, scale, heading) {
+        latitude = lat;
+        longitude = lon;
+        zoom = scale;
+        bearing = heading;
+        // Flight already updates inside an animation frame. Draw the Earth and
+        // detections before the spacecraft's new pose reaches the screen.
+        if (frame !== undefined) cancelAnimationFrame(frame);
+        draw();
+      },
+      // Degrees along the surface from the view centre down to the point drawn
+      // `offsetY` pixels below the top of the canvas, at zoom `scale`.
+      lead(offsetY, scale) {
+        const { width, height } = canvas.getBoundingClientRect();
+        const radius = globeRadius(width, height) * scale;
+        if (!radius) return 0;
+        return Math.asin(clamp((offsetY - height * globeCenterY) / radius, -.9, .9)) * degrees;
+      },
+      setDetections(rows) {
+        detections = rows.map((row) => ({ row, point: spherePoint(row.latitude, row.longitude) }));
+        hitTargets = [];
+        redraw();
+      },
+      detectionAt(clientX, clientY) {
+        const rect = canvas.getBoundingClientRect();
+        const x = (clientX - rect.left) * canvas.width / rect.width;
+        const y = (clientY - rect.top) * canvas.height / rect.height;
+        let distance = 9 * canvas.width / rect.width;
+        let closest;
+        for (const hit of hitTargets) {
+          const next = Math.hypot(x - hit.x, y - hit.y);
+          if (next < distance) {
+            closest = hit.row;
+            distance = next;
+          }
+        }
+        return closest;
+      },
+    };
   }
 
   function rotate(dx, dy) {

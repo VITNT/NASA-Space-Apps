@@ -1,6 +1,7 @@
 import { createGlobe } from "./globe.js";
 import { enhanceSelect } from "./choice-menu.js";
 import { mapDetail } from "./map-detail.js";
+import { createSatelliteFlight } from "./satellite-flight.js";
 import { seasonalMannKendall } from "./trend.js";
 
 const $ = (id) => document.getElementById(id);
@@ -9,6 +10,7 @@ const closeMenus = [
   enhanceSelect($("dataset")),
   enhanceSelect($("period-month"), { fixedCaption: true, alignEnd: true }),
   enhanceSelect($("period-year"), { fixedCaption: true, alignEnd: true, searchLabel: "Search years" }),
+  enhanceSelect($("flight-sensor"), { alignEnd: true }),
 ];
 const regions = {
   cambodia: [10.35, 14.8, 102.3, 107.75],
@@ -55,11 +57,14 @@ let mapTimer;
 let mapKey;
 const mapCache = new Map();
 let historyRequest;
+let globalHistoryAvailable = false;
 let customBounds = asBounds(regions.cambodia);
 let view = "explore";
 let selectedPeriod = "2025-02";
 let firstPeriod;
 let lastPeriod;
+let flight;
+let flightDateLimits;
 
 function asBounds([min_lat, max_lat, min_lon, max_lon]) {
   return { min_lat, max_lat, min_lon, max_lon };
@@ -121,6 +126,15 @@ function setCells(items, dots = mapDots) {
   activeGlobe().setCells(items, dots);
 }
 
+function showMapKey(dots, size) {
+  if (googleGlobe) {
+    $("map-key-label").textContent = "Pins · grouped detections";
+    return;
+  }
+  const label = dots ? "Activity dots" : `${Number(size.toPrecision(4))}° grid`;
+  $("map-key-label").textContent = `${label} · brighter = more detections`;
+}
+
 function centerMaps() {
   const area = bounds();
   globe.center(area);
@@ -151,6 +165,7 @@ function updateMapView() {
   if (vectorMap) mapLibre.resize();
   activeGlobe().reportCenter?.();
   activeGlobe().setCells(mapCells, mapDots);
+  if (mapCells.length) showMapKey(mapDots, mapCells[0].size);
   scheduleMap();
 }
 
@@ -191,10 +206,8 @@ async function initMapLibre() {
 }
 
 async function initGoogleMap() {
-  const config = await api("/map-config").catch(() => null);
-  if (!config?.googleMapsKey) return;
+  const configuration = api("/map-config").catch(() => null);
   const button = $("basemap");
-  button.hidden = false;
   const status = $("basemap-status");
   button.addEventListener("click", async () => {
     status.textContent = "";
@@ -208,6 +221,14 @@ async function initGoogleMap() {
     status.textContent = "Loading Google 3D…";
     let map;
     try {
+      const config = await configuration;
+      if (googleLoad !== load) return;
+      if (!config?.googleMapsKey) {
+        status.textContent = config
+          ? "Google 3D needs a browser key configured on this server."
+          : "Could not check Google 3D configuration. Refresh and try again.";
+        return;
+      }
       const { createGoogleMap } = await import("./google-map.js");
       const initialBounds = bounds();
       map = await createGoogleMap($("google-globe"), config.googleMapsKey, initialBounds, showCell,
@@ -226,9 +247,14 @@ async function initGoogleMap() {
       googleGlobe = map;
       updateMapView();
       status.textContent = "";
-    } catch {
+    } catch (error) {
       map?.destroy();
-      if (googleLoad === load) status.textContent = "Google 3D is unavailable. Check the Maps key, billing, or connection.";
+      if (googleLoad === load) {
+        status.textContent = error.message.startsWith("Google 3D") || error.message.startsWith("Google Maps") ||
+          error.message === "Could not reach Google Maps."
+          ? error.message
+          : "Google 3D is unavailable. Check the Maps key, billing, or connection.";
+      }
     } finally {
       if (googleLoad === load) googleLoad = undefined;
       button.disabled = false;
@@ -427,6 +453,7 @@ function resetMap() {
 }
 
 async function loadMap() {
+  if (view !== "explore") return;
   const camera = activeGlobe().getViewport();
   if (!camera) return;
   const { dots, size, viewport } = mapDetail(camera);
@@ -465,8 +492,7 @@ async function loadMap() {
     if (mapCache.size > 5) mapCache.delete(mapCache.keys().next().value);
     setCells(items, dots);
     if (items.length) $("download-points").disabled = false;
-    const label = dots ? "Activity dots" : `${Number(size.toPrecision(4))}° grid`;
-    $("map-key-label").textContent = `${label} · brighter = more detections`;
+    showMapKey(dots, size);
     $("map-message").textContent = items.length ? "" : "No mapped observations in this view";
   } catch (error) {
     if (!request.signal.aborted) {
@@ -652,77 +678,98 @@ async function loadHistory() {
   const params = sensorParam();
   note.textContent = "Loading monthly activity…";
   try {
-    // Query one calendar year at a time to stay within the API's bounded scan.
     const firstYear = Number(from.slice(0, 4));
     const lastYear = Number(to.slice(0, 4));
     const rows = [];
-    for (let year = lastYear; year >= firstYear; year--) {
-      const start = year === firstYear ? dates(from).start : `${year}-01-01`;
-      const end = year === lastYear ? dates(to).end : `${year}-12-31`;
-      if (!monthNames.some((_, index) => {
-        const period = `${year}-${String(index + 1).padStart(2, "0")}`;
-        return period >= from && period <= to && signatures(period, false);
-      })) continue;
-      const result = await api("/v1/calendar", { ...bbox, ...params, start_date: start, end_date: end, interval: "month" }, request.signal);
+    const isGlobal = bbox.min_lat === -90 && bbox.max_lat === 90 && bbox.min_lon === -180 && bbox.max_lon === 180;
+    if (globalHistoryAvailable && isGlobal) {
+      const result = await api("/v1/calendar", {
+        ...bbox, ...params, start_date: dates(from).start, end_date: dates(to).end, interval: "month",
+      }, request.signal);
       rows.push(...result.data);
+    } else {
+      for (let year = lastYear; year >= firstYear; year--) {
+        if (!monthNames.some((_, index) => {
+          const period = `${year}-${String(index + 1).padStart(2, "0")}`;
+          return period >= from && period <= to && signatures(period, false);
+        })) continue;
+        note.textContent = `Loading ${year}…${rows.length ? " Recent years are ready to explore." : ""}`;
+        const result = await api("/v1/calendar", {
+          ...bbox, ...params,
+          start_date: year === firstYear ? dates(from).start : `${year}-01-01`,
+          end_date: year === lastYear ? dates(to).end : `${year}-12-31`,
+          interval: "month",
+        }, request.signal);
+        if (request.signal.aborted) return;
+        rows.push(...result.data);
+        if (year !== firstYear) renderHistory(table, rows, from, to, year, lastYear);
+      }
     }
     if (request.signal.aborted) return;
     historyRows = rows.sort((a, b) => a.date.localeCompare(b.date));
     $("download-history").disabled = !rows.length;
     note.textContent = !rows.length ? "No eligible records in this range."
       : "Select a month to inspect it. Hatched months have no eligible records. " + (harmonizing
-        ? "Values are adjusted to what the full satellite set would have seen, so years are comparable. Hover for observed counts."
+        ? "Adjusted estimates are shown where available. Hover for coverage and observed counts."
         : "Satellite coverage can change across months.");
-    const observed = new Map(rows.map((row) => [row.date.slice(0, 7), row.active_cell_days]));
-    const index = new Map(rows.map((row) => [row.date.slice(0, 7),
-      row.harmonized_cell_days == null ? row.active_cell_days : Math.round(row.harmonized_cell_days)]));
-    const peak = Math.max(1, ...index.values());
+    renderHistory(table, rows, from, to, firstYear, lastYear);
     drawTrend(rows, from, to);
-    const header = table.createTHead().insertRow();
-    for (const name of ["Year", ...monthNames]) {
-      const cell = document.createElement("th");
-      cell.scope = "col";
-      cell.textContent = name;
-      header.append(cell);
-    }
-    const body = table.createTBody();
-    for (let year = lastYear; year >= firstYear; year--) {
-      const row = body.insertRow();
-      const yearCell = document.createElement("th");
-      yearCell.scope = "row";
-      yearCell.textContent = year;
-      row.append(yearCell);
-      monthNames.forEach((name, i) => {
-        const period = `${year}-${String(i + 1).padStart(2, "0")}`;
-        const cell = row.insertCell();
-        if (period < from || period > to) return;
-        const count = index.get(period);
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "history-cell";
-        button.dataset.level = level(count, peak);
-        button.textContent = count == null ? "—" : format(count);
-        const active = signatures(period, false);
-        const satelliteNames = (monthCoverage.get(period) ?? []).filter((item) => selectedDatasets().includes(item.dataset))
-          .map((item) => platformNames[item.platform] ?? item.platform);
-        const partial = active !== signatures(period, true);
-        button.setAttribute("aria-label", `${name} ${year}: ${count == null ? "no eligible records" : format(count) + " active cell-days"}`);
-        const adjusted = harmonizing && count != null && count !== observed.get(period);
-        if (active) {
-          button.title = satelliteNames.join(", ") + (partial ? " · partial coverage" : "")
-            + (adjusted ? ` · observed ${format(observed.get(period))}` : harmonizing && count != null && partial ? " · not adjusted" : "");
-        }
-        button.addEventListener("click", () => {
-          if (!selectPeriod(period)) return;
-          setView("explore");
-          loadSelection();
-        });
-        cell.append(button);
-      });
-    }
   } catch (error) {
-    if (!request.signal.aborted) note.textContent = error.message;
+    if (!request.signal.aborted) note.textContent = `History could not finish loading. ${error.message} Try applying the range again.`;
   }
+}
+
+function renderHistory(table, rows, from, to, firstYear, lastYear) {
+  const focused = table.contains(document.activeElement) && document.activeElement.dataset.period;
+  table.replaceChildren();
+  const observed = new Map(rows.map((row) => [row.date.slice(0, 7), row.active_cell_days]));
+  const index = new Map(rows.map((row) => [row.date.slice(0, 7),
+    row.harmonized_cell_days == null ? row.active_cell_days : Math.round(row.harmonized_cell_days)]));
+  const peak = Math.max(1, ...index.values());
+  const header = table.createTHead().insertRow();
+  for (const name of ["Year", ...monthNames]) {
+    const cell = document.createElement("th");
+    cell.scope = "col";
+    cell.textContent = name;
+    header.append(cell);
+  }
+  const body = table.createTBody();
+  for (let year = lastYear; year >= firstYear; year--) {
+    const row = body.insertRow();
+    const yearCell = document.createElement("th");
+    yearCell.scope = "row";
+    yearCell.textContent = year;
+    row.append(yearCell);
+    monthNames.forEach((name, i) => {
+      const period = `${year}-${String(i + 1).padStart(2, "0")}`;
+      const cell = row.insertCell();
+      if (period < from || period > to) return;
+      const count = index.get(period);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "history-cell";
+      button.dataset.period = period;
+      button.dataset.level = level(count, peak);
+      button.textContent = count == null ? "—" : format(count);
+      const active = signatures(period, false);
+      const satelliteNames = (monthCoverage.get(period) ?? []).filter((item) => selectedDatasets().includes(item.dataset))
+        .map((item) => platformNames[item.platform] ?? item.platform);
+      const partial = active !== signatures(period, true);
+      button.setAttribute("aria-label", `${name} ${year}: ${count == null ? "no eligible records" : format(count) + " active cell-days"}`);
+      const adjusted = harmonizing && count != null && count !== observed.get(period);
+      if (active) {
+        button.title = satelliteNames.join(", ") + (partial ? " · partial coverage" : "")
+          + (adjusted ? ` · observed ${format(observed.get(period))}` : harmonizing && count != null && partial ? " · not adjusted" : "");
+      }
+      button.addEventListener("click", () => {
+        if (!selectPeriod(period)) return;
+        setView("explore");
+        loadSelection();
+      });
+      cell.append(button);
+    });
+  }
+  if (focused) table.querySelector(`[data-period="${focused}"]`)?.focus({ preventScroll: true });
 }
 
 // Tests the adjusted monthly series for a monotonic trend. Months that no
@@ -763,16 +810,33 @@ function drawTrend(rows, from, to) {
 }
 
 function setView(next) {
+  const leavingFlight = view === "flight" && next !== "flight";
+  const returnFocus = leavingFlight && $("flight").contains(document.activeElement);
+  if (leavingFlight) flight.stop();
+  if (view === "history" && next !== "history") historyRequest?.abort();
+  if (view === "explore" && next !== "explore") {
+    clearTimeout(mapTimer);
+    mapRequest?.abort();
+    mapKey = undefined;
+  }
   view = next;
-  if (next !== "explore") closeMenus.forEach((close) => close?.());
+  closeMenus.forEach((close) => close?.());
   $("explore").hidden = next !== "explore";
   $("history").hidden = next !== "history";
+  $("flight").hidden = next !== "flight";
   document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.view === next));
   if (next === "history") loadHistory();
-  else {
+  else if (next === "flight") {
+    if (!flight) {
+      flight = createSatelliteFlight($("flight"), api, () => setView("explore"));
+      if (flightDateLimits) flight.setDateLimits(...flightDateLimits);
+    }
+    flight.start();
+  } else {
     mapLibre?.resize();
     scheduleMap();
   }
+  if (returnFocus) $("take-orbit").focus({ preventScroll: true });
 }
 
 async function init() {
@@ -791,12 +855,17 @@ async function init() {
     if (!coverage.length) throw new Error("The archive contains no usable coverage.");
     areaLabel = health.area_label;
     harmonizing = health.calibration_available;
+    globalHistoryAvailable = health.global_history_available;
     status(areaLabel ? areaLabel + " archive" : "Global FIRMS archive", "ready");
     for (const [key, name] of Object.entries(datasets)) {
       if (coverage.some((row) => row.dataset === key)) $("dataset").add(new Option(name, key));
     }
-    const first = coverage.map((row) => row.first_date).sort()[0].slice(0, 7);
-    const latest = coverage.map((row) => row.last_date).sort().at(-1).slice(0, 7);
+    const firstDay = coverage.map((row) => row.first_date).sort()[0];
+    const latestDay = coverage.map((row) => row.last_date).sort().at(-1);
+    flightDateLimits = [firstDay, latestDay];
+    flight?.setDateLimits(...flightDateLimits);
+    const first = firstDay.slice(0, 7);
+    const latest = latestDay.slice(0, 7);
     for (const id of ["history-start", "history-end"]) {
       $(id).min = first;
       $(id).max = latest;

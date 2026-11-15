@@ -1,10 +1,10 @@
 # NASA FIRMS fire-activity data pipeline
 
 This project converts the downloaded, real NASA FIRMS hotspot exports into a
-validated Parquet dataset for DuckDB analytics and Burnline, its browser-based
+validated Parquet dataset for DuckDB analytics and Luminite, its browser-based
 fire activity explorer. It never generates product observations and never modifies the source CSVs.
 
-## Open Burnline on macOS
+## Open Luminite on macOS
 
 From the project directory:
 
@@ -14,16 +14,20 @@ python3 -m venv .venv
 .venv/bin/python -m uvicorn firms_pipeline.api:app --host 127.0.0.1 --port 8765
 ```
 
-Open [Burnline](http://127.0.0.1:8765/). FastAPI serves the UI, font, imagery,
+Open [Luminite](http://127.0.0.1:8765/). FastAPI serves the UI, font, imagery,
 and data API from the same origin. Select an area or enter bounding coordinates,
 pick a month, and select a day, a week, or several days to see their detections.
 The map opens on the global archive and uses orange activity dots at wide zoom
 levels. Zoom in to see progressively finer square cells for the visible area.
 Brighter marks contain more detections. Select one to open its summary.
-History accepts a month range.
+History accepts a month range. Without an active calibration, full-month
+global History can use precomputed observed cell-days tied to the archive's run ID.
+Other queries show recent years first as they finish. To rebuild the observed
+snapshot for a replacement archive, run
+`.venv/bin/python -m tools.build_global_history` and restart the server.
 The app can export the calendar and individual hotspot rows as CSV and the map as PNG.
 
-Burnline opens with a dark basemap in MapLibre GL JS. It uses Natural Earth
+Luminite opens with a dark basemap in MapLibre GL JS. It uses Natural Earth
 land shapes via world-atlas 2.0.2, Natural Earth international borders and
 country labels, and provincial and district data prepared from Natural Earth
 and geoBoundaries. Labels use Noto Sans glyphs. The bundled geography includes
@@ -31,21 +35,23 @@ the upstream source manifest, per-source licenses, and font license.
 
 Choose **NASA satellite** for NASA GIBS Blue Marble imagery with the same fire cells,
 borders, and place labels. Both styles support the globe and 2D map. If MapLibre
-or the dark basemap cannot load, Burnline uses its bundled Blue Marble map.
+or the dark basemap cannot load, Luminite uses its bundled Blue Marble map.
 Pinch or scroll with two fingers to zoom, or use the on-screen zoom buttons.
 
 ### Optional Google 3D satellite basemap
 
 Google Earth Pro is a desktop app, and the [old Google Earth API](https://developers.google.com/earth)
-is retired. Burnline can display [Google's 3D satellite view](https://developers.google.com/maps/documentation/javascript/3d/overview)
+is retired. Luminite can display [Google's 3D satellite view](https://developers.google.com/maps/documentation/javascript/3d/overview)
 with the same FIRMS observations, calendar, and map controls.
 
 1. In your Google Cloud project, [enable the Maps JavaScript API and billing](https://developers.google.com/maps/documentation/javascript/get-api-key).
 2. Use a browser API key restricted to the Maps JavaScript API and to the
-   websites that will serve Burnline. For this local setup, allow
+   websites that will serve Luminite. For this local setup, allow
    `http://127.0.0.1:8765/*`. A Cloud project ID or map ID cannot replace the API key.
-3. Start or restart Burnline with the browser key in its environment. On macOS
-   with zsh, you can enter it without putting it in shell history:
+3. Restart Luminite. For loopback requests, the app can load an existing
+   `.local/google-maps.env` containing a `FIRMS_GOOGLE_MAPS_BROWSER_KEY` assignment.
+   An environment variable takes precedence and is required for hosted deployments.
+   On macOS with zsh, you can enter the key without putting it in shell history:
 
    ```sh
    read -rs 'FIRMS_GOOGLE_MAPS_BROWSER_KEY?Google Maps browser key: '
@@ -53,7 +59,7 @@ with the same FIRMS observations, calendar, and map controls.
    .venv/bin/python -m uvicorn firms_pipeline.api:app --host 127.0.0.1 --port 8765
    ```
 
-4. Reload Burnline and select **Google 3D**. Select it again to return to the
+4. Reload Luminite and select **Google 3D**. Select it again to return to the
    preceding map. PNG export is available on the dark and NASA satellite maps.
 
 The browser can see its restricted key. Keep server keys out of this setting.

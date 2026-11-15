@@ -3,9 +3,9 @@ import { octagon } from "./map-detail.js";
 
 const mapLibreDist = "https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.2/dist/";
 const blueMarbleTiles = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpeg";
-const fireLayer = "burnline-fire-grid";
-const dotLayer = "burnline-fire-dots";
-const satelliteLayer = "burnline-blue-marble";
+const fireLayer = "luminite-fire-grid";
+const dotLayer = "luminite-fire-dots";
+const satelliteLayer = "luminite-blue-marble";
 const emptyGrid = { type: "FeatureCollection", features: [] };
 const mercatorLimit = 85.051129;
 function loadAsset(element) {

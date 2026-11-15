@@ -1,4 +1,4 @@
-# Image for hosting Burnline on a Hugging Face Space (see tools/deploy_huggingface.py).
+# Image for hosting Luminite on a Hugging Face Space (see tools/deploy_huggingface.py).
 FROM python:3.13-slim
 
 # Hugging Face Spaces run the container as user id 1000.

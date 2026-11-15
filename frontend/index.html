@@ -4,18 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Explore satellite-observed burning activity from NASA FIRMS.">
-  <title>FIRMS Fire Activity Explorer · Burnline</title>
-  <link rel="stylesheet" href="/static/styles.css?v=attribution">
+  <title>FIRMS Fire Activity Explorer · Luminite</title>
+  <link rel="stylesheet" href="/static/styles.css?v=flight-camera">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <h1>Burnline</h1>
+      <h1>Luminite</h1>
       <span>NASA FIRMS</span>
     </div>
     <nav aria-label="Workspace">
       <button type="button" data-view="explore" aria-pressed="true">Explore</button>
       <button type="button" data-view="history" aria-pressed="false">History</button>
+      <button type="button" id="take-orbit" data-view="flight" aria-pressed="false">Take orbit</button>
       <button type="button" id="about">Methodology</button>
     </nav>
   </header>
@@ -108,13 +109,88 @@
         <div class="basemap-options" role="group" aria-label="Map view">
           <button type="button" id="view-globe" aria-pressed="true">Globe</button>
           <button type="button" id="view-flat" aria-pressed="false">2D map</button>
-          <button type="button" id="basemap" aria-pressed="false" hidden>Google 3D</button>
+          <button type="button" id="basemap" aria-pressed="false">Google 3D</button>
         </div>
         <div class="basemap-options" role="group" aria-label="Basemap">
           <button type="button" id="style-dark" aria-pressed="false" disabled>Dark</button>
           <button type="button" id="style-satellite" aria-pressed="true" disabled>NASA satellite</button>
         </div>
         <p id="basemap-status" role="status"></p>
+      </div>
+    </section>
+
+    <section id="flight" class="scene flight" aria-labelledby="flight-title" hidden>
+      <canvas id="flight-globe" width="1100" height="660" tabindex="0" aria-label="Flight view. Use the flight controls to steer."></canvas>
+
+      <aside class="location flight-readout">
+        <h2 id="flight-title">Satellite flight</h2>
+        <p id="flight-model-credit" class="status" hidden>Terra model · <a href="https://science.nasa.gov/3d-resources/terra/" target="_blank" rel="noopener">NASA / Christian A. Lopez</a></p>
+        <dl class="flight-telemetry">
+          <div><dt>Position</dt><dd id="flight-position">—</dd></div>
+          <div><dt>Heading</dt><dd id="flight-heading">—</dd></div>
+          <div><dt>Speed</dt><dd id="flight-speed" title="Percent of normal cruise speed">0%</dd></div>
+        </dl>
+      </aside>
+
+      <div class="flight-target" aria-hidden="true"></div>
+      <div class="flight-craft" aria-hidden="true">
+        <canvas id="flight-terra" width="720" height="412" hidden></canvas>
+        <div class="flight-craft-model">
+          <div class="flight-wing flight-wing-left"></div>
+          <div class="flight-wing flight-wing-right"></div>
+          <div class="flight-bus flight-bus-bottom"></div>
+          <div class="flight-bus flight-bus-side flight-bus-left"></div>
+          <div class="flight-bus flight-bus-side flight-bus-right"></div>
+          <div class="flight-bus flight-bus-end flight-bus-front"></div>
+          <div class="flight-bus flight-bus-end flight-bus-back"></div>
+          <div class="flight-bus flight-bus-top"></div>
+          <div class="flight-dish"></div>
+        </div>
+      </div>
+
+      <aside class="flight-inspector" aria-label="Recorded detections">
+        <details class="filters">
+          <summary>Observation data <span class="chevron" aria-hidden="true"></span></summary>
+          <div class="filter-fields">
+            <label for="flight-date">Date (UTC)</label>
+            <input id="flight-date" type="date" value="2025-03-08" required>
+            <label for="flight-sensor">Instrument</label>
+            <select id="flight-sensor">
+              <option value="">MODIS + VIIRS</option>
+              <option value="terra">Terra / MODIS</option>
+              <option value="aqua">Aqua / MODIS</option>
+              <option value="noaa20">NOAA-20 / VIIRS</option>
+              <option value="snpp">Suomi NPP / VIIRS</option>
+            </select>
+          </div>
+        </details>
+        <div class="flight-legend">
+          <span class="flight-modis">MODIS</span>
+          <span class="flight-viirs">VIIRS</span>
+        </div>
+        <p class="status">Simulated flight · Recorded NASA FIRMS detections</p>
+        <p id="flight-data-status" class="status" role="status"></p>
+        <p id="flight-detection" role="status" hidden></p>
+      </aside>
+
+      <div class="flight-dock">
+        <div class="flight-guide">
+          <p><kbd>W</kbd> Forward · <kbd>A</kbd><kbd>D</kbd> Steer · <kbd>S</kbd> Reverse · <kbd>Shift</kbd> Boost</p>
+          <p>Scroll or <kbd>+</kbd><kbd>−</kbd> to zoom. Select a marker to inspect it.</p>
+        </div>
+        <div class="basemap-options flight-controls" aria-label="Flight controls">
+          <button type="button" data-flight-control="left" aria-label="Turn left">←</button>
+          <button type="button" data-flight-control="forward" aria-label="Accelerate">↑</button>
+          <button type="button" data-flight-control="reverse" aria-label="Reverse">↓</button>
+          <button type="button" data-flight-control="right" aria-label="Turn right">→</button>
+          <button type="button" data-flight-control="boost">Boost</button>
+        </div>
+        <div class="basemap-options flight-actions" aria-label="Camera and flight view">
+          <button type="button" id="flight-zoom-out" aria-label="Zoom out">−</button>
+          <button type="button" id="flight-zoom-in" aria-label="Zoom in">+</button>
+          <button type="button" id="flight-reset">Reset flight</button>
+          <button type="button" id="flight-exit">Exit flight</button>
+        </div>
       </div>
     </section>
 
@@ -142,6 +218,6 @@
     <p>The map groups NASA FIRMS MODIS and VIIRS detections into a latitude–longitude grid for the selected dates and satellite record. At wide zoom levels, dots mark occupied cells. Zoom in to see smaller grid cells. Brighter marks contain more detections. Select a mark to see its detection count, days with detections, platforms, and summed fire radiative power (FRP) in megawatts. The Hotspots CSV contains individual detections. The dark map uses Natural Earth and geoBoundaries geography, and the satellite basemap adds NASA Blue Marble imagery.</p>
     <p><a href="https://www.spaceappschallenge.org/2026/challenges/modis-and-viirs-hot-spots/" target="_blank" rel="noopener">NASA Space Apps 2026 ↗</a></p>
   </dialog>
-  <script type="module" src="/static/app.js?v=global-map"></script>
+  <script type="module" src="/static/app.js?v=flight-camera"></script>
 </body>
 </html>

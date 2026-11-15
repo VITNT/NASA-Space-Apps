@@ -1,4 +1,4 @@
-"""Publish Burnline to Hugging Face: data to a public dataset, the app to a Space.
+"""Publish Luminite to Hugging Face: data to a public dataset, the app to a Space.
 
 Run `hf auth login` once first. Re-running is safe: an interrupted data upload
 resumes, and files that are already uploaded are skipped.
@@ -14,7 +14,7 @@ from pathlib import Path
 from huggingface_hub import HfApi
 
 SPACE_HEADER = """---
-title: Burnline
+title: Luminite
 emoji: 🔥
 colorFrom: red
 colorTo: yellow
@@ -47,13 +47,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, help="Folder that contains data/merged and data/catalog")
     parser.add_argument("--skip-data", action="store_true", help="Only update the app")
-    parser.add_argument("--space", default="burnline", help="Space name (default: burnline)")
-    parser.add_argument("--dataset", default="burnline-data", help="Dataset name (default: burnline-data)")
+    parser.add_argument("--space", default="luminite", help="Space name (default: luminite)")
+    parser.add_argument("--dataset", default="luminite-data", help="Dataset name (default: luminite-data)")
+    parser.add_argument("--owner", help="Account or organization that owns both (default: your own account)")
     args = parser.parse_args()
 
     api = HfApi()
-    user = api.whoami()["name"]
-    dataset_id = f"{user}/{args.dataset}"
+    user = args.owner or api.whoami()["name"]
+    # A full "owner/name" lets the data live under a different account than the Space.
+    dataset_id = args.dataset if "/" in args.dataset else f"{user}/{args.dataset}"
     space_id = f"{user}/{args.space}"
 
     if not args.skip_data:
@@ -70,6 +72,7 @@ def main() -> None:
             repo_type="dataset",
             folder_path=folder,
             allow_patterns=["data/merged/**", "data/catalog/**"],
+            ignore_patterns=["**/.DS_Store"],
         )
 
     api.create_repo(space_id, repo_type="space", space_sdk="docker", exist_ok=True)

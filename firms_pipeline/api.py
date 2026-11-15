@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+from calendar import monthrange
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -31,6 +33,8 @@ Platform = Literal["aqua", "terra", "noaa20", "snpp"]
 ConfidenceClass = Literal["low", "nominal", "high"]
 DayNight = Literal["D", "N"]
 MAP_CELL_SIZES = tuple(2.0 ** exponent for exponent in range(-8, 2))
+GLOBAL_HISTORY = Path(__file__).with_name("resources") / "global_history.json"
+MAPS_KEY_ENV = "FIRMS_GOOGLE_MAPS_BROWSER_KEY"
 
 
 class ResultPage(BaseModel):
@@ -103,6 +107,14 @@ class DataRepository:
                 and calibration_data.get("source_run_id") == self.point_manifest["run_id"]
             ):
                 self.calibration = calibration_data
+        self.global_history = None
+        if not self.calibration:
+            try:
+                snapshot = json.loads(GLOBAL_HISTORY.read_text(encoding="utf-8"))
+                if snapshot["schema_version"] == 1 and snapshot["point_run_id"] == self.point_manifest["run_id"]:
+                    self.global_history = snapshot["series"]
+            except (OSError, ValueError, KeyError):
+                pass
 
     @contextmanager
     def connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
@@ -163,6 +175,19 @@ def _repository(request: Request) -> DataRepository:
     return request.app.state.repository
 
 
+def _local_maps_key(path: Path) -> str:
+    """Read the Git-ignored local key as data, without sourcing shell code."""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name, separator, value = line.strip().removeprefix("export ").partition("=")
+            if separator and name.strip() == MAPS_KEY_ENV:
+                values = shlex.split(value, comments=True)
+                return values[0] if len(values) == 1 else ""
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def create_app(project_root: Path | None = None) -> FastAPI:
     source_root = Path(__file__).resolve().parents[1]
     local_archive = source_root / ".local" / "archive"
@@ -187,12 +212,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             return FileResponse(frontend_root / "index.html")
 
         # Only expose a browser key configured specifically for this frontend.
-        google_maps_key = os.environ.get("FIRMS_GOOGLE_MAPS_BROWSER_KEY", "").strip()
+        google_maps_key = os.environ.get(MAPS_KEY_ENV, "").strip()
+        local_maps_key = _local_maps_key(source_root / ".local" / "google-maps.env")
 
         @app.get("/map-config", include_in_schema=False)
-        def map_config() -> JSONResponse:
+        def map_config(request: Request) -> JSONResponse:
+            loopback = {"127.0.0.1", "::1", "localhost"}
+            is_local = request.url.hostname in loopback and request.client and request.client.host in loopback
             return JSONResponse(
-                {"googleMapsKey": google_maps_key or None},
+                {"googleMapsKey": google_maps_key or (local_maps_key if is_local else None) or None},
                 headers={"Cache-Control": "no-store"},
             )
 
@@ -208,6 +236,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "source_rows": repo.aggregate_manifest["source_rows"],
             "area_label": repo.point_manifest.get("area_label"),
             "calibration_available": repo.calibration is not None,
+            "global_history_available": repo.global_history is not None,
         }
 
     @app.get("/v1/calibration")
@@ -264,10 +293,22 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         interval: Literal["day", "month"] = "day",
         month: Annotated[int | None, Query(ge=1, le=12)] = None,
     ) -> ResultPage:
-        _date_span(start_date, end_date, 366 if month is None else 366 * 6)
         if max_lat < min_lat:
             raise HTTPException(status_code=422, detail="Invalid latitude bounds")
         repo = _repository(request)
+        whole_months = start_date.day == 1 and end_date.day == monthrange(end_date.year, end_date.month)[1]
+        if (
+            repo.global_history is not None and interval == "month" and whole_months
+            and (min_lat, max_lat, min_lon, max_lon) == (-90, 90, -180, 180)
+        ):
+            _date_span(start_date, end_date, 366 * 100)
+            start, end = start_date.isoformat(), end_date.isoformat()
+            data = [
+                row for row in repo.global_history[dataset or "all"]
+                if start <= row["date"] <= end and (month is None or int(row["date"][5:7]) == month)
+            ]
+            return ResultPage(data=data, count=len(data))
+        _date_span(start_date, end_date, 366 if month is None else 366 * 6)
         longitude_sql, longitude_parameters = _bbox_clause(min_lon, max_lon)
         conditions = [
             "year BETWEEN ? AND ?", "acq_date BETWEEN ? AND ?",
@@ -294,7 +335,26 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         # for those platforms. It is null when no platform covered the month.
         target = repo.harmonization_target(dataset)
         if target is None:
-            harmonized, factor_joins = "NULL::DOUBLE", ""
+            data = repo.rows(f"""
+                WITH cell_days AS (
+                    SELECT acq_date, {CELL_Y_SQL} AS y, {CELL_X_SQL} AS x,
+                        count_if(dataset = 'modis') AS modis,
+                        count_if(dataset = 'viirs_snpp') AS viirs_snpp,
+                        count_if(dataset = 'viirs_noaa20') AS viirs_noaa20
+                    FROM {repo.points}
+                    WHERE {' AND '.join(conditions)}
+                    GROUP BY acq_date, y, x
+                )
+                SELECT date_trunc('{interval}', acq_date)::DATE AS date,
+                    count(*) AS active_cell_days,
+                    sum(modis)::BIGINT AS modis,
+                    sum(viirs_snpp)::BIGINT AS viirs_snpp,
+                    sum(viirs_noaa20)::BIGINT AS viirs_noaa20,
+                    count_if(modis > 0 AND (viirs_snpp > 0 OR viirs_noaa20 > 0)) AS shared_cell_days,
+                    NULL::DOUBLE AS harmonized_cell_days
+                FROM cell_days GROUP BY 1 ORDER BY 1
+            """, parameters)
+            return ResultPage(data=data, count=len(data))
         else:
             factor = f"CASE WHEN r.source = {target} THEN 1 ELSE coalesce(f.factor, g.factor) END"
             harmonized = f"""CASE WHEN bool_or(r.source IS NULL OR (r.usable > 0 AND {factor} IS NULL)) THEN NULL
