@@ -11,7 +11,7 @@ from typing import Annotated, Any, Iterator, Literal
 
 import duckdb
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,11 @@ class ResultPage(BaseModel):
     data: list[dict[str, Any]]
     count: int = Field(ge=0)
     truncated: bool = False
+
+
+class MapGrid(BaseModel):
+    data: list[dict[str, Any]]
+    cell_size: float
 
 
 class DataRepository:
@@ -135,13 +140,23 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         ),
     )
     app.state.repository = repository
-    frontend_root = repository.project_root / "frontend"
+    frontend_root = Path(__file__).resolve().parents[1] / "frontend"
     if frontend_root.exists():
         app.mount("/static", StaticFiles(directory=frontend_root), name="static")
 
         @app.get("/", include_in_schema=False)
         def frontend() -> FileResponse:
             return FileResponse(frontend_root / "index.html")
+
+        # Only expose a browser key configured specifically for this frontend.
+        google_maps_key = os.environ.get("FIRMS_GOOGLE_MAPS_BROWSER_KEY", "").strip()
+
+        @app.get("/map-config", include_in_schema=False)
+        def map_config() -> JSONResponse:
+            return JSONResponse(
+                {"googleMapsKey": google_maps_key or None},
+                headers={"Cache-Control": "no-store"},
+            )
 
     @app.get("/health")
     def health(request: Request) -> dict[str, Any]:
@@ -153,6 +168,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "aggregate_run_id": repo.aggregate_manifest["run_id"],
             "spatial_run_id": repo.spatial_manifest["run_id"],
             "source_rows": repo.aggregate_manifest["source_rows"],
+            "area_label": repo.point_manifest.get("area_label"),
         }
 
     @app.get("/v1/coverage", response_model=ResultPage)
@@ -173,6 +189,133 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         """
         data = repo.rows(query)
         return ResultPage(data=data, count=len(data))
+
+    @app.get("/v1/coverage/monthly", response_model=ResultPage)
+    def monthly_coverage(request: Request) -> ResultPage:
+        repo = _repository(request)
+        data = repo.rows(f"""
+            SELECT month_start, dataset, platform, is_complete_month,
+                active_days = calendar_days AS platform_complete
+            FROM {repo.monthly}
+            ORDER BY month_start, dataset, platform
+        """)
+        return ResultPage(data=data, count=len(data))
+
+    @app.get("/v1/calendar", response_model=ResultPage)
+    def burning_calendar(
+        request: Request,
+        start_date: date,
+        end_date: date,
+        min_lat: Annotated[float, Query(ge=-90, le=90)],
+        max_lat: Annotated[float, Query(ge=-90, le=90)],
+        min_lon: Annotated[float, Query(ge=-180, le=180)],
+        max_lon: Annotated[float, Query(ge=-180, le=180)],
+        dataset: Dataset | None = None,
+        interval: Literal["day", "month"] = "day",
+        month: Annotated[int | None, Query(ge=1, le=12)] = None,
+    ) -> ResultPage:
+        _date_span(start_date, end_date, 366 if month is None else 366 * 6)
+        if max_lat < min_lat:
+            raise HTTPException(status_code=422, detail="Invalid latitude bounds")
+        repo = _repository(request)
+        longitude_sql, longitude_parameters = _bbox_clause(min_lon, max_lon)
+        conditions = [
+            "year BETWEEN ? AND ?", "acq_date BETWEEN ? AND ?",
+            "latitude BETWEEN ? AND ?", longitude_sql,
+            "confidence_class IN ('nominal', 'high')",
+            "(hotspot_type = 0 OR hotspot_type IS NULL)",
+        ]
+        parameters = [start_date.year, end_date.year, start_date, end_date, min_lat, max_lat, *longitude_parameters]
+        if dataset is not None:
+            conditions.append("dataset = ?")
+            parameters.append(dataset)
+        if month is not None:
+            conditions.append("month = ?")
+            parameters.append(month)
+        elif start_date.year == end_date.year:
+            conditions.append("month BETWEEN ? AND ?")
+            parameters.extend([start_date.month, end_date.month])
+
+        # UTC cell-days give each occupied 0.1° cell the same weight across
+        # instruments and repeat passes. This is an activity index, not an event count.
+        query = f"""
+            WITH cell_days AS (
+                SELECT acq_date, least(899, floor(latitude * 10)) AS y,
+                    CASE WHEN longitude = 180 THEN -1800 ELSE floor(longitude * 10) END AS x,
+                    count_if(dataset = 'modis') AS modis,
+                    count_if(dataset = 'viirs_snpp') AS viirs_snpp,
+                    count_if(dataset = 'viirs_noaa20') AS viirs_noaa20
+                FROM {repo.points}
+                WHERE {' AND '.join(conditions)}
+                GROUP BY acq_date, y, x
+            )
+            SELECT CAST(date_trunc('{interval}', acq_date) AS DATE) AS date,
+                count(*)::BIGINT AS active_cell_days,
+                sum(modis)::BIGINT AS modis,
+                sum(viirs_snpp)::BIGINT AS viirs_snpp,
+                sum(viirs_noaa20)::BIGINT AS viirs_noaa20,
+                count_if(modis > 0 AND (viirs_snpp > 0 OR viirs_noaa20 > 0)) AS shared_cell_days
+            FROM cell_days
+            GROUP BY 1 ORDER BY 1
+        """
+        data = repo.rows(query, parameters)
+        return ResultPage(data=data, count=len(data))
+
+    @app.get("/v1/spatial/grid", response_model=MapGrid)
+    def map_grid(
+        request: Request,
+        start_date: date,
+        end_date: date,
+        min_lat: Annotated[float, Query(ge=-90, le=90)],
+        max_lat: Annotated[float, Query(ge=-90, le=90)],
+        min_lon: Annotated[float, Query(ge=-180, le=180)],
+        max_lon: Annotated[float, Query(ge=-180, le=180)],
+        dataset: Dataset | None = None,
+        days: Annotated[list[date] | None, Query(max_length=31)] = None,
+    ) -> MapGrid:
+        _date_span(start_date, end_date, 31)
+        if max_lat < min_lat:
+            raise HTTPException(status_code=422, detail="Invalid latitude bounds")
+        if days and any(day < start_date or day > end_date for day in days):
+            raise HTTPException(status_code=422, detail="Selected days must be within the date range")
+        longitude_span = max_lon - min_lon
+        if longitude_span < 0:
+            longitude_span += 360
+        span = max(max_lat - min_lat, longitude_span)
+        # Use a finer grid for local views and keep the number of cells bounded for world views.
+        cell_size = next(size for threshold, size in ((12, .25), (60, .5), (100, 1), (360, 2)) if span <= threshold)
+        repo = _repository(request)
+        longitude_sql, longitude_parameters = _bbox_clause(min_lon, max_lon)
+        conditions = [
+            "year BETWEEN ? AND ?", "acq_date BETWEEN ? AND ?",
+            "latitude BETWEEN ? AND ?", longitude_sql,
+        ]
+        parameters: list[Any] = [start_date.year, end_date.year, start_date, end_date, min_lat, max_lat, *longitude_parameters]
+        if start_date.year == end_date.year:
+            conditions.append("month BETWEEN ? AND ?")
+            parameters.extend([start_date.month, end_date.month])
+        if dataset is not None:
+            conditions.append("dataset = ?")
+            parameters.append(dataset)
+        if days:
+            conditions.append("acq_date IN (SELECT unnest(?::DATE[]))")
+            parameters.append(days)
+
+        data = repo.rows(f"""
+            WITH observations AS (
+                SELECT floor(CASE WHEN longitude = 180 THEN -180 ELSE longitude END / {cell_size}) AS x,
+                    least({90 / cell_size - 1}, floor(latitude / {cell_size})) AS y,
+                    acq_date, platform, frp_mw
+                FROM {repo.points}
+                WHERE {' AND '.join(conditions)}
+            )
+            SELECT x * {cell_size} AS west, y * {cell_size} AS south,
+                count(*) AS detection_count, count(DISTINCT acq_date) AS observed_days,
+                list(DISTINCT platform ORDER BY platform) AS platforms, sum(frp_mw)::DOUBLE AS frp_sum_mw
+            FROM observations
+            GROUP BY x, y ORDER BY y, x
+        """, parameters)
+        return MapGrid(data=data, cell_size=cell_size)
 
     @app.get("/v1/activity/monthly", response_model=ResultPage)
     def monthly_activity(

@@ -1,8 +1,100 @@
 # NASA FIRMS fire-activity data pipeline
 
 This project converts the downloaded, real NASA FIRMS hotspot exports into a
-validated Parquet dataset suitable for DuckDB analytics and the future product
-API. It never generates product observations and never modifies the source CSVs.
+validated Parquet dataset for DuckDB analytics and Burnline, its browser-based
+fire activity explorer. It never generates product observations and never modifies the source CSVs.
+
+## Open Burnline on macOS
+
+From the project directory:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m uvicorn firms_pipeline.api:app --host 127.0.0.1 --port 8765
+```
+
+Open [Burnline](http://127.0.0.1:8765/). FastAPI serves the UI, font, imagery,
+and data API from the same origin. Select an area or enter bounding coordinates,
+pick a month, and select a day, a week, or several days to see their detections.
+The map groups detections into square grid cells. Brighter cells have more detections,
+and selecting a cell opens its summary. History accepts a month range.
+The app can export the calendar and individual hotspot rows as CSV and the map as PNG.
+
+Burnline opens with a dark basemap in MapLibre GL JS. It uses Natural Earth
+land shapes via world-atlas 2.0.2, Natural Earth international borders and
+country labels, and provincial and district data prepared from Natural Earth
+and geoBoundaries. Labels use Noto Sans glyphs. The bundled geography includes
+the upstream source manifest, per-source licenses, and font license.
+
+Choose **NASA satellite** for NASA GIBS Blue Marble imagery with the same fire cells,
+borders, and place labels. Both styles support the globe and 2D map. If MapLibre
+or the dark basemap cannot load, Burnline uses its bundled Blue Marble map.
+Pinch or scroll with two fingers to zoom, or use the on-screen zoom buttons.
+
+### Optional Google 3D satellite basemap
+
+Google Earth Pro is a desktop app, and the [old Google Earth API](https://developers.google.com/earth)
+is retired. Burnline can display [Google's 3D satellite view](https://developers.google.com/maps/documentation/javascript/3d/overview)
+with the same FIRMS observations, calendar, and map controls.
+
+1. In your Google Cloud project, [enable the Maps JavaScript API and billing](https://developers.google.com/maps/documentation/javascript/get-api-key).
+2. Use a browser API key restricted to the Maps JavaScript API and to the
+   websites that will serve Burnline. For this local setup, allow
+   `http://127.0.0.1:8765/*`. A Cloud project ID or map ID cannot replace the API key.
+3. Start or restart Burnline with the browser key in its environment. On macOS
+   with zsh, you can enter it without putting it in shell history:
+
+   ```sh
+   read -rs 'FIRMS_GOOGLE_MAPS_BROWSER_KEY?Google Maps browser key: '
+   export FIRMS_GOOGLE_MAPS_BROWSER_KEY
+   .venv/bin/python -m uvicorn firms_pipeline.api:app --host 127.0.0.1 --port 8765
+   ```
+
+4. Reload Burnline and select **Google 3D**. Select it again to return to the
+   preceding map. PNG export is available on the dark and NASA satellite maps.
+
+The browser can see its restricted key. Keep server keys out of this setting.
+Google's [3D coverage varies by location](https://developers.google.com/maps/coverage);
+Cambodia is listed without full Maps 3D coverage.
+The dark and NASA satellite maps work without a key or a connection to Google.
+
+The API needs validated Parquet. If you have annual Cambodia country exports and
+want to run a regional preview while the full products are unavailable, use a
+fresh data directory:
+
+```sh
+.venv/bin/python -m tools.prepare_cambodia "$HOME/Downloads/NASA DATA" .local/cambodia
+FIRMS_PROJECT_ROOT="$PWD/.local/cambodia" .venv/bin/python -m uvicorn firms_pipeline.api:app --host 127.0.0.1 --port 8765
+```
+
+The preview uses only available country-years and labels its scope in the UI.
+Set `FIRMS_PROJECT_ROOT` to the directory containing the full archive's
+`data/` folder to use the global products.
+
+If you downloaded already-merged Parquet (a folder holding `merged/` and
+`catalog/`), adopt it without re-running ingestion:
+
+```sh
+.venv/bin/python -m tools.adopt_merged "$HOME/Downloads/data"
+```
+
+The download is validated and left untouched. Its point files are hard-linked
+into `data/merged`, and aggregates and H3 products are built from the months
+that are present. A partial download gets its own manifest with the real row
+count and is labelled "Partial global" in the UI. Existing `data/processed`
+products stay available with `FIRMS_DATA_PROFILE=live`.
+
+The burning calendar counts occupied 0.1° cell-days using nominal and high
+confidence detections and excluding classified non-vegetation hotspots.
+Each cell counts once per UTC day across selected records. Raw instrument
+counts remain visible. This common-grid index reduces repeat counting, but
+differences in instrument sensitivity and observation schedules remain.
+The historical comparison requires at least two prior complete months with the
+same set of contributing platforms.
+
+Earth imagery comes from NASA Earth Observatory's Blue Marble: Next Generation,
+produced by Reto Stöckli. Google Sans Flex is bundled with its SIL Open Font License.
 
 ## Current inputs
 
@@ -130,6 +222,8 @@ The service provides:
 
 - `GET /health`
 - `GET /v1/coverage`
+- `GET /v1/coverage/monthly`
+- `GET /v1/calendar`
 - `GET /v1/activity/monthly`
 - `GET /v1/activity/daily`
 - `GET /v1/hotspots`
