@@ -758,6 +758,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     merged_spatial_parser.add_argument("--threads", type=int, default=None, help="DuckDB worker threads")
     merged_spatial_parser.add_argument("--resume", action="store_true", help="Reuse completed monthly fragments")
+    calibrate_parser = subparsers.add_parser(
+        "calibrate", help="Calculate VIIRS-to-MODIS sensitivity factors from overlap years"
+    )
+    calibrate_parser.add_argument("--threads", type=int, default=None, help="DuckDB worker threads")
     return parser.parse_args(argv)
 
 
@@ -790,6 +794,10 @@ def main(argv: list[str] | None = None) -> int:
             from .merge import build_spatial_merged
 
             return build_spatial_merged(args.root, threads=args.threads, resume=args.resume)
+        if args.command == "calibrate":
+            from .calibrate import build_calibration
+
+            return build_calibration(args.root, threads=args.threads)
         return validate_existing(args.root)
     except (duckdb.Error, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

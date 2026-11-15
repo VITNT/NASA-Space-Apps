@@ -29,6 +29,29 @@ class CalendarTests(unittest.TestCase):
                     ) AS p(year, month, acq_date, latitude, longitude, dataset, confidence_class, hotspot_type)
                 )"""
 
+            # Terra and Suomi NPP observed all of February; NOAA-20 did not.
+            @property
+            def monthly(self):
+                return """(
+                    SELECT * FROM (VALUES
+                        (DATE '2025-02-01', 'modis', 'terra', true, 28, 28),
+                        (DATE '2025-02-01', 'viirs_snpp', 'snpp', true, 28, 28),
+                        (DATE '2025-02-01', 'viirs_noaa20', 'noaa20', true, 20, 28)
+                    ) AS m(month_start, dataset, platform, is_complete_month, active_days, calendar_days)
+                )"""
+
+            @property
+            def factors(self):
+                return """(
+                    SELECT * FROM (VALUES
+                        (12, 104, 2, 13, 5, 1.5),
+                        (-999, -999, 2, 13, 5, 2.0)
+                    ) AS f(ry, rx, month, target, source, factor)
+                )"""
+
+            def harmonization_target(self, dataset):
+                return {None: 13, "modis": 1}.get(dataset)
+
         app.state.repository = PointsFixture(repo.project_root, repo.profile)
         self.client = TestClient(app)
         self.params = {
@@ -44,8 +67,24 @@ class CalendarTests(unittest.TestCase):
         self.assertEqual(first, {
             "date": "2025-02-01", "active_cell_days": 2,
             "modis": 2, "viirs_snpp": 1, "viirs_noaa20": 1, "shared_cell_days": 1,
+            "harmonized_cell_days": 1.5,
         })
         self.assertEqual(second["active_cell_days"], 1)
+
+    def test_harmonized_counts_full_month_platforms_and_scales_by_region(self):
+        # The NOAA-20 cell is dropped because NOAA-20 missed part of the month;
+        # the remaining cell is scaled by its region's factor.
+        response = self.client.get("/v1/calendar", params={**self.params, "interval": "month"})
+        (month,) = response.json()["data"]
+        self.assertEqual((month["active_cell_days"], month["harmonized_cell_days"]), (3, 3.0))
+
+        # A lone platform that is its own target needs no scaling.
+        response = self.client.get("/v1/calendar", params={**self.params, "interval": "month", "dataset": "modis"})
+        self.assertEqual(response.json()["data"][0]["harmonized_cell_days"], 2.0)
+
+    def test_harmonized_is_null_without_full_month_coverage_or_calibration(self):
+        response = self.client.get("/v1/calendar", params={**self.params, "dataset": "viirs_noaa20"})
+        self.assertIsNone(response.json()["data"][0]["harmonized_cell_days"])
 
     def test_monthly_totals_keep_cell_days_and_support_sensor_filter(self):
         response = self.client.get("/v1/calendar", params={**self.params, "interval": "month", "dataset": "modis"})

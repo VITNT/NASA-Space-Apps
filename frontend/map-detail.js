@@ -7,6 +7,20 @@ export function cameraBounds(lat, lon, latitudeRadius, longitudeRadius) {
   ];
 }
 
+// Grid cells are drawn as regular octagons inscribed in their square.
+// Returns the eight [latitude, longitude] corners, counter-clockwise.
+export function octagon(south, west, size, inset = size * .025) {
+  const north = south + size - inset;
+  const east = west + size - inset;
+  south += inset;
+  west += inset;
+  const cut = (east - west) / (2 + Math.SQRT2);
+  return [
+    [south, west + cut], [south, east - cut], [south + cut, east], [north - cut, east],
+    [north, east - cut], [north, west + cut], [north - cut, west], [south + cut, west],
+  ];
+}
+
 export function mapDetail([south, north, west, east]) {
   const span = Math.max(north - south, east - west);
   if (span >= 115) return { dots: true, size: 1 };

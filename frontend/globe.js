@@ -1,6 +1,6 @@
 import { bindMapZoom } from "./map-zoom.js";
 import { createEarthRenderer } from "./earth-renderer.js";
-import { cameraBounds } from "./map-detail.js";
+import { cameraBounds, octagon } from "./map-detail.js";
 
 const radians = Math.PI / 180;
 const degrees = 1 / radians;
@@ -127,14 +127,28 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
       for (let x = first; x < width; x += worldWidth) {
         if (dots) drawDot(cell, x + (cell.longitude - cell.west) * pixelsPerDegree,
           y + (cell.south + cellSize - cell.latitude) * pixelsPerDegree);
-        else ctx.fillRect(x + inset, y + inset, size - 2 * inset, size - 2 * inset);
+        else drawOctagon(x + size / 2, y + size / 2, size / 2 - inset);
       }
     }
   }
 
   function drawDot(cell, x, y) {
+    drawOctagon(x, y, .7 + cell.strength * 1.4);
+  }
+
+  // A regular octagon with flat sides, `apothem` from centre to each side.
+  function drawOctagon(x, y, apothem) {
+    const cut = apothem * (Math.SQRT2 - 1);
     ctx.beginPath();
-    ctx.arc(x, y, .7 + cell.strength * 1.4, 0, Math.PI * 2);
+    ctx.moveTo(x - cut, y - apothem);
+    ctx.lineTo(x + cut, y - apothem);
+    ctx.lineTo(x + apothem, y - cut);
+    ctx.lineTo(x + apothem, y + cut);
+    ctx.lineTo(x + cut, y + apothem);
+    ctx.lineTo(x - cut, y + apothem);
+    ctx.lineTo(x - apothem, y + cut);
+    ctx.lineTo(x - apothem, y - cut);
+    ctx.closePath();
     ctx.fill();
   }
 
@@ -442,12 +456,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
       cellsByLocation = new Map(items.map((cell) => [`${cell.south},${cell.west}`, cell]));
       cells = items.map((cell) => {
         if (dots) return { cell, center: spherePoint(cell.latitude, cell.longitude) };
-        const inset = cell.size * .025;
-        const south = cell.south + inset;
-        const west = cell.west + inset;
-        const north = cell.south + cell.size - inset;
-        const east = cell.west + cell.size - inset;
-        const corners = [spherePoint(south, west), spherePoint(south, east), spherePoint(north, east), spherePoint(north, west)];
+        const corners = octagon(cell.south, cell.west, cell.size).map(([lat, lon]) => spherePoint(lat, lon));
         return { cell, corners };
       });
       redraw();

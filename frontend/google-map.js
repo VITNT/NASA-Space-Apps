@@ -1,5 +1,5 @@
 import { bindMapZoom } from "./map-zoom.js";
-import { cameraBounds } from "./map-detail.js";
+import { cameraBounds, octagon } from "./map-detail.js";
 
 let loader;
 const minZoomRange = 50;
@@ -85,23 +85,13 @@ export async function createGoogleMap(host, key, bounds, onSelect, onMove, onErr
   let cellTimer;
   let dots;
   function polygonFor(cell) {
-    const inset = cell.size * .025;
-    const south = cell.south + inset;
-    const north = cell.south + cell.size - inset;
-    const west = cell.west + inset;
-    const east = cell.west + cell.size - inset;
     const polygon = new Polygon3DInteractiveElement({
       path: dots ? Array.from({ length: 8 }, (_, i) => {
         const angle = i * Math.PI / 4;
         const radius = cell.size * (.2 + .2 * cell.strength);
         return { lat: cell.south + cell.size / 2 + radius * Math.sin(angle),
           lng: cell.west + cell.size / 2 + radius * Math.cos(angle) };
-      }) : [
-        { lat: south, lng: west },
-        { lat: south, lng: east },
-        { lat: north, lng: east },
-        { lat: north, lng: west },
-      ],
+      }) : octagon(cell.south, cell.west, cell.size).map(([lat, lng]) => ({ lat, lng })),
       altitudeMode: "CLAMP_TO_GROUND",
       fillColor: cell.color,
       strokeWidth: 0,

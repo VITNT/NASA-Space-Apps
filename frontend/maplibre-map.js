@@ -1,4 +1,5 @@
 import { addGeography, loadBasemap } from "./geography.js";
+import { octagon } from "./map-detail.js";
 
 const mapLibreDist = "https://cdn.jsdelivr.net/npm/maplibre-gl@5.6.2/dist/";
 const blueMarbleTiles = "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/BlueMarble_ShadedRelief_Bathymetry/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpeg";
@@ -46,17 +47,10 @@ function cellFeature(cell, dots) {
     if (Math.abs(cell.latitude) > mercatorLimit) return [];
     return [{ type: "Feature", properties, geometry: { type: "Point", coordinates: [cell.longitude, cell.latitude] } }];
   }
-  const inset = cell.size * .025;
-  const west = cell.west + inset;
-  const east = cell.west + cell.size - inset;
-  const south = Math.max(-mercatorLimit, cell.south + inset);
-  const north = Math.min(mercatorLimit, cell.south + cell.size - inset);
-  if (south >= north) return [];
-  return [{
-    type: "Feature",
-    properties,
-    geometry: { type: "Polygon", coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]] },
-  }];
+  if (cell.south >= mercatorLimit || cell.south + cell.size <= -mercatorLimit) return [];
+  const ring = octagon(cell.south, cell.west, cell.size)
+    .map(([lat, lon]) => [lon, Math.max(-mercatorLimit, Math.min(mercatorLimit, lat))]);
+  return [{ type: "Feature", properties, geometry: { type: "Polygon", coordinates: [[...ring, ring[0]]] } }];
 }
 
 function waitForBasemap(map) {

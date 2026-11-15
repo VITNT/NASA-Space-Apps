@@ -399,6 +399,8 @@ details[open] > summary > .chevron,
 #history-form input { display: block; margin-top: 4px; }
 .history p, .label { color: var(--muted); font-size: 12px; }
 .history p { margin: 18px 0 12px; }
+.history p.history-trend { color: inherit; font-size: 14px; max-width: 78ch; }
+.history-trend small { color: var(--muted); display: block; margin-top: 4px; font-size: 12px; }
 .history-scroll { overflow-x: auto; }
 .history table { border-spacing: 4px; width: 100%; }
 .history th { color: var(--muted); padding: 4px; font-size: 12px; font-weight: 500; }

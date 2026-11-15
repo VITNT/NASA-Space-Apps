@@ -16,6 +16,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .pipeline import sql_string
+from .sensitivity import (
+    CELL_DAY_FILTER,
+    CELL_X_SQL,
+    CELL_Y_SQL,
+    COMPLETE_PLATFORM_SQL,
+    GLOBAL_REGION,
+    PLATFORM_BIT_SQL,
+)
 
 
 Dataset = Literal["modis", "viirs_noaa20", "viirs_snpp"]
@@ -79,6 +87,22 @@ class DataRepository:
         self.point_manifest = json.loads(self.point_manifest_path.read_text(encoding="utf-8"))
         self.aggregate_manifest = json.loads(self.aggregate_manifest_path.read_text(encoding="utf-8"))
         self.spatial_manifest = json.loads(self.spatial_manifest_path.read_text(encoding="utf-8"))
+        # Harmonization is optional: without validated factors the calendar
+        # still serves observed cell-days.
+        calibration_path = data_root / "catalog" / "calibration.json"
+        self.factors_path = data_root / "merged" / "calibration" / "factors.parquet"
+        self.calibration = None
+        if self.profile == "merged" and calibration_path.exists() and self.factors_path.exists():
+            try:
+                calibration_data = json.loads(calibration_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                calibration_data = {}
+            if (
+                calibration_data.get("status") == "validated"
+                and calibration_data.get("schema_version") == 2
+                and calibration_data.get("source_run_id") == self.point_manifest["run_id"]
+            ):
+                self.calibration = calibration_data
 
     @contextmanager
     def connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
@@ -106,6 +130,16 @@ class DataRepository:
     @property
     def monthly(self) -> str:
         return f"read_parquet({sql_string(self.monthly_path)})"
+
+    @property
+    def factors(self) -> str:
+        return f"read_parquet({sql_string(self.factors_path)})"
+
+    def harmonization_target(self, dataset: str | None) -> int | None:
+        """The constellation that harmonized cell-days are expressed in."""
+        if not self.calibration:
+            return None
+        return self.calibration["targets"].get(dataset or "all")
 
     @property
     def spatial(self) -> str:
@@ -173,7 +207,19 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "spatial_run_id": repo.spatial_manifest["run_id"],
             "source_rows": repo.aggregate_manifest["source_rows"],
             "area_label": repo.point_manifest.get("area_label"),
+            "calibration_available": repo.calibration is not None,
         }
+
+    @app.get("/v1/calibration")
+    def calibration_info(request: Request) -> dict[str, Any]:
+        repo = _repository(request)
+        if not repo.calibration:
+            return {
+                "available": False,
+                "message": "No validated harmonization for this data. Run `python -m firms_pipeline calibrate`. "
+                "Until then, months with different satellites are not comparable.",
+            }
+        return {"available": True, **repo.calibration}
 
     @app.get("/v1/coverage", response_model=ResultPage)
     def coverage(request: Request) -> ResultPage:
@@ -226,8 +272,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         conditions = [
             "year BETWEEN ? AND ?", "acq_date BETWEEN ? AND ?",
             "latitude BETWEEN ? AND ?", longitude_sql,
-            "confidence_class IN ('nominal', 'high')",
-            "(hotspot_type = 0 OR hotspot_type IS NULL)",
+            CELL_DAY_FILTER,
         ]
         parameters = [start_date.year, end_date.year, start_date, end_date, min_lat, max_lat, *longitude_parameters]
         if dataset is not None:
@@ -242,24 +287,58 @@ def create_app(project_root: Path | None = None) -> FastAPI:
 
         # UTC cell-days give each occupied 0.1° cell the same weight across
         # instruments and repeat passes. This is an activity index, not an event count.
+        #
+        # harmonized_cell_days restates each month in the cell-days the full
+        # constellation would have reported. Only platforms that observed the
+        # whole month count, and each 1° region is scaled by the factor measured
+        # for those platforms. It is null when no platform covered the month.
+        target = repo.harmonization_target(dataset)
+        if target is None:
+            harmonized, factor_joins = "NULL::DOUBLE", ""
+        else:
+            factor = f"CASE WHEN r.source = {target} THEN 1 ELSE coalesce(f.factor, g.factor) END"
+            harmonized = f"""CASE WHEN bool_or(r.source IS NULL OR (r.usable > 0 AND {factor} IS NULL)) THEN NULL
+                    ELSE round(sum(r.usable * {factor})::DOUBLE, 1) END"""
+            factor_joins = f"""
+                LEFT JOIN {repo.factors} f ON f.ry = r.ry AND f.rx = r.rx AND f.month = month(r.acq_date)
+                    AND f.target = {target} AND f.source = r.source
+                LEFT JOIN {repo.factors} g ON g.ry = {GLOBAL_REGION} AND g.month = month(r.acq_date)
+                    AND g.target = {target} AND g.source = r.source"""
         query = f"""
-            WITH cell_days AS (
-                SELECT acq_date, least(899, floor(latitude * 10)) AS y,
-                    CASE WHEN longitude = 180 THEN -1800 ELSE floor(longitude * 10) END AS x,
+            WITH coverage AS (
+                SELECT month_start, bit_or({PLATFORM_BIT_SQL})::INTEGER AS source
+                FROM {repo.monthly}
+                WHERE {COMPLETE_PLATFORM_SQL}{f" AND dataset = {sql_string(dataset)}" if dataset else ""}
+                GROUP BY month_start
+            ),
+            cell_days AS (
+                SELECT acq_date, {CELL_Y_SQL} AS y, {CELL_X_SQL} AS x,
                     count_if(dataset = 'modis') AS modis,
                     count_if(dataset = 'viirs_snpp') AS viirs_snpp,
-                    count_if(dataset = 'viirs_noaa20') AS viirs_noaa20
+                    count_if(dataset = 'viirs_noaa20') AS viirs_noaa20,
+                    bit_or({PLATFORM_BIT_SQL})::INTEGER AS mask
                 FROM {repo.points}
                 WHERE {' AND '.join(conditions)}
                 GROUP BY acq_date, y, x
+            ),
+            regional AS (
+                SELECT c.acq_date, floor(c.y / 10)::INTEGER AS ry, floor(c.x / 10)::INTEGER AS rx, v.source,
+                    count(*) AS cell_days,
+                    count_if((c.mask & v.source) != 0) AS usable,
+                    sum(c.modis) AS modis, sum(c.viirs_snpp) AS viirs_snpp, sum(c.viirs_noaa20) AS viirs_noaa20,
+                    count_if(c.modis > 0 AND (c.viirs_snpp > 0 OR c.viirs_noaa20 > 0)) AS shared
+                FROM cell_days c
+                LEFT JOIN coverage v ON v.month_start = CAST(date_trunc('month', c.acq_date) AS DATE)
+                GROUP BY ALL
             )
-            SELECT CAST(date_trunc('{interval}', acq_date) AS DATE) AS date,
-                count(*)::BIGINT AS active_cell_days,
-                sum(modis)::BIGINT AS modis,
-                sum(viirs_snpp)::BIGINT AS viirs_snpp,
-                sum(viirs_noaa20)::BIGINT AS viirs_noaa20,
-                count_if(modis > 0 AND (viirs_snpp > 0 OR viirs_noaa20 > 0)) AS shared_cell_days
-            FROM cell_days
+            SELECT CAST(date_trunc('{interval}', r.acq_date) AS DATE) AS date,
+                sum(r.cell_days)::BIGINT AS active_cell_days,
+                sum(r.modis)::BIGINT AS modis,
+                sum(r.viirs_snpp)::BIGINT AS viirs_snpp,
+                sum(r.viirs_noaa20)::BIGINT AS viirs_noaa20,
+                sum(r.shared)::BIGINT AS shared_cell_days,
+                {harmonized} AS harmonized_cell_days
+            FROM regional r{factor_joins}
             GROUP BY 1 ORDER BY 1
         """
         data = repo.rows(query, parameters)

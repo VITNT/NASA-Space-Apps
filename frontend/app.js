@@ -1,6 +1,7 @@
 import { createGlobe } from "./globe.js";
 import { enhanceSelect } from "./choice-menu.js";
 import { mapDetail } from "./map-detail.js";
+import { seasonalMannKendall } from "./trend.js";
 
 const $ = (id) => document.getElementById(id);
 const closeMenus = [
@@ -39,6 +40,7 @@ const monthNames = Array.from({ length: 12 }, (_, i) =>
 
 let coverage = [];
 let monthCoverage = new Map();
+let harmonizing = false;
 let areaLabel;
 // Selected UTC days of the visible month, sorted. Empty means the whole month.
 let selected = [];
@@ -340,12 +342,21 @@ function drawCalendar() {
   $("download-calendar").disabled = !calendar.length;
 }
 
+// Harmonized cell-days restate a month as the full satellite set would have
+// seen it, so months with different satellites can be compared.
+function harmonizedTotal(rows) {
+  return rows.reduce((sum, row) => sum + row.harmonized_cell_days, 0);
+}
+
 function drawSelection() {
   const rows = selected.length ? calendar.filter((row) => selected.includes(row.date)) : calendar;
   const total = (key) => format(rows.reduce((sum, row) => sum + row[key], 0));
   const sources = (monthCoverage.get(selectedPeriod) ?? []).map((row) => row.dataset);
   showDetails(selectionLabel() ?? "Month overview", rows.length ? [
     [selected.length === 1 ? "Active cells" : "Active cell-days", total("active_cell_days")],
+    ...(rows.every((row) => row.harmonized_cell_days != null)
+      && Math.round(harmonizedTotal(rows)) !== rows.reduce((sum, row) => sum + row.active_cell_days, 0)
+      ? [["Full-constellation equivalent", format(Math.round(harmonizedTotal(rows)))]] : []),
     ...selectedDatasets().filter((key) => sources.includes(key)).map((key) => [datasets[key] + " detections", total(key)]),
     ...(sources.includes("modis") && sources.some((key) => key !== "modis") && !$("dataset").value
       ? [["MODIS + VIIRS overlaps", total("shared_cell_days")]] : []),
@@ -469,11 +480,17 @@ async function loadAnomaly(period, bbox, rows, signal) {
   const year = Number(period.slice(0, 4));
   const month = Number(period.slice(5));
   const active = signatures(period, false);
-  if (!rows.length || !active || active !== signatures(period, true)) return;
+  if (!rows.length || !active) return;
+  // With harmonization any prior month with full coverage from some platform
+  // is comparable. Without it, only months with the same satellites are.
+  const harmonized = rows.every((row) => row.harmonized_cell_days != null);
+  if (!harmonized && active !== signatures(period, true)) return;
+  const key = harmonized ? "harmonized_cell_days" : "active_cell_days";
   const prior = [];
   for (let y = Math.max(2000, year - 5); y < year; y++) {
     const previous = `${y}-${period.slice(5)}`;
-    if (signatures(previous, false) === active && signatures(previous, true) === active) {
+    const complete = signatures(previous, true);
+    if (harmonized ? complete : complete === active && signatures(previous, false) === active) {
       prior.push(dates(previous));
     }
   }
@@ -483,13 +500,14 @@ async function loadAnomaly(period, bbox, rows, signal) {
   }, signal);
   if (signal.aborted) return;
   const matching = new Set(prior.map((span) => span.start));
-  const values = historic.data.filter((row) => matching.has(row.date)).map((row) => row.active_cell_days).sort((a, b) => a - b);
+  const values = historic.data.filter((row) => matching.has(row.date) && row[key] != null).map((row) => row[key]).sort((a, b) => a - b);
   if (values.length < 2) return;
   const median = (values[Math.floor((values.length - 1) / 2)] + values[Math.ceil((values.length - 1) / 2)]) / 2;
   if (!median) return;
-  const delta = (rows.reduce((sum, row) => sum + row.active_cell_days, 0) - median) / median;
+  const delta = (rows.reduce((sum, row) => sum + row[key], 0) - median) / median;
   $("anomaly").textContent = new Intl.NumberFormat("en", { style: "percent", signDisplay: "exceptZero" }).format(delta);
-  $("anomaly").title = `Median of ${values.length} previous ${monthNames[month - 1]} values: ${format(median)} cell-days`;
+  $("anomaly").title = `Median of ${values.length} previous ${monthNames[month - 1]} values: ${format(Math.round(median))} cell-days`
+    + (harmonized ? ", adjusted for the satellites flying each year" : "");
 }
 
 function sensorParam() {
@@ -528,7 +546,9 @@ async function loadSelection() {
     const active = signatures(period, false);
     const full = signatures(period, true);
     $("coverage-note").textContent = !active ? "No archive coverage for this month."
-      : active !== full ? "Partial instrument coverage. This month is excluded from median comparisons."
+      : active !== full ? (calendar.some((row) => row.harmonized_cell_days != null)
+        ? "Partial instrument coverage. The comparison uses only instruments that observed the whole month."
+        : "Partial instrument coverage. This month is excluded from median comparisons.")
       : calendar.length ? "" : "No qualifying detections in this area.";
     if (active && !$("dataset").value) {
       const present = new Set((monthCoverage.get(period) ?? []).map((row) => row.dataset));
@@ -621,6 +641,7 @@ async function loadHistory() {
   const table = $("history-table");
   const note = $("history-note");
   table.replaceChildren();
+  $("history-trend").hidden = true;
   $("download-history").disabled = true;
   historyRows = [];
   if (!from || !to || from > to) {
@@ -648,9 +669,15 @@ async function loadHistory() {
     if (request.signal.aborted) return;
     historyRows = rows.sort((a, b) => a.date.localeCompare(b.date));
     $("download-history").disabled = !rows.length;
-    note.textContent = rows.length ? "Select a month to inspect it. Hatched months have no eligible records. Satellite coverage can change across months." : "No eligible records in this range.";
-    const index = new Map(rows.map((row) => [row.date.slice(0, 7), row.active_cell_days]));
+    note.textContent = !rows.length ? "No eligible records in this range."
+      : "Select a month to inspect it. Hatched months have no eligible records. " + (harmonizing
+        ? "Values are adjusted to what the full satellite set would have seen, so years are comparable. Hover for observed counts."
+        : "Satellite coverage can change across months.");
+    const observed = new Map(rows.map((row) => [row.date.slice(0, 7), row.active_cell_days]));
+    const index = new Map(rows.map((row) => [row.date.slice(0, 7),
+      row.harmonized_cell_days == null ? row.active_cell_days : Math.round(row.harmonized_cell_days)]));
     const peak = Math.max(1, ...index.values());
+    drawTrend(rows, from, to);
     const header = table.createTHead().insertRow();
     for (const name of ["Year", ...monthNames]) {
       const cell = document.createElement("th");
@@ -680,7 +707,11 @@ async function loadHistory() {
           .map((item) => platformNames[item.platform] ?? item.platform);
         const partial = active !== signatures(period, true);
         button.setAttribute("aria-label", `${name} ${year}: ${count == null ? "no eligible records" : format(count) + " active cell-days"}`);
-        if (active) button.title = satelliteNames.join(", ") + (partial ? " · partial coverage" : "");
+        const adjusted = harmonizing && count != null && count !== observed.get(period);
+        if (active) {
+          button.title = satelliteNames.join(", ") + (partial ? " · partial coverage" : "")
+            + (adjusted ? ` · observed ${format(observed.get(period))}` : harmonizing && count != null && partial ? " · not adjusted" : "");
+        }
         button.addEventListener("click", () => {
           if (!selectPeriod(period)) return;
           setView("explore");
@@ -692,6 +723,43 @@ async function loadHistory() {
   } catch (error) {
     if (!request.signal.aborted) note.textContent = error.message;
   }
+}
+
+// Tests the adjusted monthly series for a monotonic trend. Months that no
+// platform observed in full are left out; observed months without fire count as zero.
+function drawTrend(rows, from, to) {
+  const output = $("history-trend");
+  if (!harmonizing) return;
+  const values = new Map(rows.map((row) => [row.date.slice(0, 7), row.harmonized_cell_days]));
+  const points = [];
+  for (let year = Number(from.slice(0, 4)); year <= Number(to.slice(0, 4)); year++) {
+    for (let month = 1; month <= 12; month++) {
+      const period = `${year}-${String(month).padStart(2, "0")}`;
+      if (period < from || period > to || !signatures(period, true)) continue;
+      const value = values.has(period) ? values.get(period) : 0;
+      if (value != null) points.push({ year, month, value });
+    }
+  }
+  const years = new Set(points.map((point) => point.year)).size;
+  const result = years >= 5 ? seasonalMannKendall(points) : null;
+  output.hidden = false;
+  if (!result) {
+    output.textContent = "Trend test: choose a range of at least five years with fire activity.";
+    return;
+  }
+  const mean = points.reduce((sum, point) => sum + point.value, 0) / points.length;
+  const rate = new Intl.NumberFormat("en", { style: "percent", signDisplay: "exceptZero", maximumFractionDigits: 1 }).format(result.slope / mean);
+  const p = result.p < .001 ? "p < 0.001" : "p = " + result.p.toFixed(3);
+  const significant = result.p < .05;
+  const headline = significant
+    ? `${result.s > 0 ? "Increasing" : "Decreasing"} trend, ${rate} per year`
+    : "No significant trend";
+  const detail = document.createElement("small");
+  detail.textContent = `Seasonal Mann-Kendall test on ${points.length} adjusted months, ${points[0].year}–${points.at(-1).year}: `
+    + `τ = ${result.tau.toFixed(2)}, Z = ${result.z.toFixed(2)}, ${p}`
+    + (significant ? "" : `, Sen slope ${rate} per year`)
+    + ". Trends that cross 2012 or 2018 rely on the satellite adjustment.";
+  output.replaceChildren(headline, detail);
 }
 
 function setView(next) {
@@ -722,6 +790,7 @@ async function init() {
     }
     if (!coverage.length) throw new Error("The archive contains no usable coverage.");
     areaLabel = health.area_label;
+    harmonizing = health.calibration_available;
     status(areaLabel ? areaLabel + " archive" : "Global FIRMS archive", "ready");
     for (const [key, name] of Object.entries(datasets)) {
       if (coverage.some((row) => row.dataset === key)) $("dataset").add(new Option(name, key));

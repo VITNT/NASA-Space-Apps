@@ -98,13 +98,22 @@ products stay available with `FIRMS_DATA_PROFILE=live`.
 The burning calendar counts occupied 0.1° cell-days using nominal and high
 confidence detections and excluding classified non-vegetation hotspots.
 Each cell counts once per UTC day across selected records. Raw instrument
-counts remain visible. This common-grid index reduces repeat counting, but
-differences in instrument sensitivity and observation schedules remain.
-The historical comparison requires at least two prior complete months with the
-same set of contributing platforms.
+counts remain visible. Instruments still differ in sensitivity, so
+`python -m firms_pipeline calibrate` measures per-region factors from the years
+the satellites overlap, and the calendar also reports `harmonized_cell_days`:
+each month restated as the full constellation would have seen it. The
+historical comparison and the History view use that value, so months with
+different satellites are comparable. Method, validation and limits are in
+[CALIBRATION.md](CALIBRATION.md). The History view also runs a seasonal
+Mann-Kendall trend test with a Sen slope on the adjusted monthly series for the
+selected area and range. Without calibration, the comparison requires
+at least two prior complete months with the same set of contributing platforms.
 
 Earth imagery comes from NASA Earth Observatory's Blue Marble: Next Generation,
 produced by Reto Stöckli. Google Sans Flex is bundled with its SIL Open Font License.
+
+Data citations, product documentation, software acknowledgements, and a
+ready-to-use attribution paragraph are provided in [REFERENCES.md](REFERENCES.md).
 
 ## Current inputs
 
@@ -234,6 +243,7 @@ The service provides:
 - `GET /v1/coverage`
 - `GET /v1/coverage/monthly`
 - `GET /v1/calendar`
+- `GET /v1/calibration`
 - `GET /v1/activity/monthly`
 - `GET /v1/activity/daily`
 - `GET /v1/hotspots`
