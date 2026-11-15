@@ -57,7 +57,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange) {
     geometry = undefined;
     redraw();
   };
-  earth.src = "/static/assets/earth.jpg";
+  earth.src = new URL("./assets/earth.jpg", import.meta.url).href;
 
   earthCanvas.addEventListener("webglcontextlost", () => {
     renderer = null;

@@ -115,6 +115,58 @@ produced by Reto Stöckli. Google Sans Flex is bundled with its SIL Open Font Li
 Data citations, product documentation, software acknowledgements, and a
 ready-to-use attribution paragraph are provided in [REFERENCES.md](REFERENCES.md).
 
+## Host Burnline for free (GitHub Pages + Hugging Face)
+
+Burnline can run with no server. GitHub Pages serves the `frontend` folder, a
+public Hugging Face dataset holds the data, and DuckDB-WASM runs the queries in
+the visitor's browser, fetching only the parts of each Parquet file it needs.
+
+1. Build the browser data. The merged archive is ordered by time, so this
+   writes a second copy sorted by location and pre-aggregated (about 7 GB,
+   five to ten minutes):
+
+   ```sh
+   python -m tools.build_web_data
+   ```
+
+2. Try it locally. Restart the API and open
+   `http://127.0.0.1:8765/static/?data=/web`. Without `?data=/web` the page
+   uses the FastAPI server as before, so the two can be compared.
+
+3. Upload the data to a public Hugging Face dataset:
+
+   ```sh
+   pip install huggingface_hub
+   hf auth login
+   python -m tools.publish_web_data
+   ```
+
+   The last line it prints is the data address.
+
+4. In the GitHub repository settings, set **Pages → Source** to
+   **GitHub Actions**. The workflow in `.github/workflows/pages.yml` uses
+   `proros1/burnline-web` by default and publishes the site when you push
+   frontend or workflow changes to `codex/burnline-pages`. To use another
+   dataset, set the Actions variable `BURNLINE_DATA_URL` to its data address.
+   GitHub Pages is free for public repositories.
+
+To use the hosted data without the workflow, set `dataUrl` in
+`frontend/config.js` instead. For the Google 3D basemap, set the Actions
+variable `BURNLINE_GOOGLE_MAPS_BROWSER_KEY`, or `googleMapsKey` in that file.
+
+Differences from the server:
+
+- Area edges snap to the grid a query reads. The calendar uses 0.1° cells, so
+  an area whose edges are not multiples of 0.1° (the Cambodia preset is one)
+  counts about 1% differently. Whole-degree areas match the server.
+- At wide zoom the map adds up 1/4° or 1/16° cells, so an area edge that cuts
+  through a cell includes the whole cell when its center is inside.
+- Only the routes the page uses are available: the calendar, the map grid, the
+  hotspot export and coverage.
+
+After new data is merged, repeat steps 1 and 3. `build_web_data` skips years it
+has already built, so pass `--year 2026 --force` to rebuild a year that changed.
+
 ## Current inputs
 
 The ingestion command expects exactly these four downloaded exports:

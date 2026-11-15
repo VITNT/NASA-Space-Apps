@@ -2,6 +2,8 @@ import { createGlobe } from "./globe.js";
 import { enhanceSelect } from "./choice-menu.js";
 import { mapDetail } from "./map-detail.js";
 import { seasonalMannKendall } from "./trend.js";
+import config from "./config.js";
+import { createData } from "./data.js";
 
 const $ = (id) => document.getElementById(id);
 const closeMenus = [
@@ -77,7 +79,16 @@ function selectedDatasets() {
   return $("dataset").value ? [$("dataset").value] : [...new Set(coverage.map((row) => row.dataset))];
 }
 
+// With a data folder configured the browser answers every request itself.
+// `?data=/path` points one visit at a folder on this site, for testing.
+const dataOverride = new URLSearchParams(location.search).get("data");
+const dataUrl = /^\/(?!\/)/.test(dataOverride ?? "") ? dataOverride : config.dataUrl;
+const localData = dataUrl ? createData(dataUrl) : null;
+
 async function api(path, params, signal) {
+  if (path === "/map-config") {
+    if (localData || config.googleMapsKey) return { googleMapsKey: config.googleMapsKey || null };
+  } else if (localData) return localData(path, params, signal);
   const query = params ? `?${new URLSearchParams(params)}` : "";
   const response = await fetch(path + query, { signal });
   if (!response.ok) {

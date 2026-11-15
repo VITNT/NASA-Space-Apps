@@ -11,7 +11,7 @@ from typing import Annotated, Any, Iterator, Literal
 
 import duckdb
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -180,11 +180,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     app.state.repository = repository
     frontend_root = Path(__file__).resolve().parents[1] / "frontend"
     if frontend_root.exists():
-        app.mount("/static", StaticFiles(directory=frontend_root), name="static")
+        # The page uses relative links so the same files also work on static hosting.
+        app.mount("/static", StaticFiles(directory=frontend_root, html=True), name="static")
 
         @app.get("/", include_in_schema=False)
-        def frontend() -> FileResponse:
-            return FileResponse(frontend_root / "index.html")
+        def frontend() -> RedirectResponse:
+            return RedirectResponse("/static/")
+
+        # The browser-only data products, so `/static/?data=/web` can be tried locally.
+        web_root = repository.project_root / "data" / "web"
+        if (web_root / "meta.json").exists():
+            app.mount("/web", StaticFiles(directory=web_root), name="web")
 
         # Only expose a browser key configured specifically for this frontend.
         google_maps_key = os.environ.get("FIRMS_GOOGLE_MAPS_BROWSER_KEY", "").strip()
