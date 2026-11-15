@@ -1,214 +1,766 @@
+import { createGlobe } from "./globe.js";
+import { enhanceSelect } from "./choice-menu.js";
+
+const $ = (id) => document.getElementById(id);
+const closeMenus = [
+  enhanceSelect($("region")),
+  enhanceSelect($("dataset")),
+  enhanceSelect($("period-month"), { fixedCaption: true, alignEnd: true }),
+  enhanceSelect($("period-year"), { fixedCaption: true, alignEnd: true, searchLabel: "Search years" }),
+];
 const regions = {
-  global: { label: "Global", minLat: -90, maxLat: 90, minLon: -180, maxLon: 180 },
-  seasia: { label: "Southeast Asia", minLat: -12, maxLat: 30, minLon: 90, maxLon: 145 },
-  amazon: { label: "Amazon basin", minLat: -22, maxLat: 10, minLon: -82, maxLon: -44 },
-  africa: { label: "Central and southern Africa", minLat: -36, maxLat: 16, minLon: 5, maxLon: 48 },
+  cambodia: [10.35, 14.8, 102.3, 107.75],
+  seasia: [-12, 29, 92, 143],
+  global: [-90, 90, -180, 180],
+  amazon: [-21, 9, -80, -44],
+  africa: [-36, 10, 9, 52],
 };
+const datasets = { modis: "MODIS", viirs_noaa20: "VIIRS NOAA-20", viirs_snpp: "VIIRS Suomi NPP" };
+const platformNames = { aqua: "Aqua", terra: "Terra", noaa20: "NOAA-20", snpp: "Suomi NPP" };
+const monthFormat = new Intl.DateTimeFormat("en", { month: "long", year: "numeric", timeZone: "UTC" });
+const monthLabel = new Intl.DateTimeFormat("en", { month: "long", timeZone: "UTC" });
+const formatter = new Intl.NumberFormat("en");
+const format = (value) => formatter.format(value);
+const dates = (period) => {
+  const [year, month] = period.split("-").map(Number);
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const days = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return { first, days, start: `${period}-01`, end: `${period}-${days}` };
+};
+const dayFormat = new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+const weekdayFormat = new Intl.DateTimeFormat("en", { weekday: "short", timeZone: "UTC" });
+const isoDay = (period, number) => `${period}-${String(number).padStart(2, "0")}`;
+// Monday-based position of the first of the month, used to group days into calendar weeks.
+const weekOffset = (first) => (first.getUTCDay() + 6) % 7;
+const monthNames = Array.from({ length: 12 }, (_, i) =>
+  new Intl.DateTimeFormat("en", { month: "short", timeZone: "UTC" }).format(new Date(Date.UTC(2020, i, 1))),
+);
 
-const colors = ["#62d8e7", "#ff9b54", "#f15b50"];
-const state = { cells: [], selectedCell: null };
-const $ = (selector) => document.querySelector(selector);
-const fmt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+let coverage = [];
+let monthCoverage = new Map();
+let areaLabel;
+// Selected UTC days of the visible month, sorted. Empty means the whole month.
+let selected = [];
+let mode = "day";
+let rangeAnchor = null;
+let calendar = [];
+let historyRows = [];
+let selectionRequest;
+let mapRequest;
+let historyRequest;
+let customBounds = asBounds(regions.cambodia);
+let view = "explore";
+let selectedPeriod = "2025-02";
+let firstPeriod;
+let lastPeriod;
 
-function monthDates(value) {
-  const [year, month] = value.split("-").map(Number);
-  const last = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return { year, month, start: `${value}-01`, end: `${value}-${String(last).padStart(2, "0")}` };
+function asBounds([min_lat, max_lat, min_lon, max_lon]) {
+  return { min_lat, max_lat, min_lon, max_lon };
 }
 
-async function getJson(path, params = {}) {
-  const query = new URLSearchParams();
-  Object.entries(params).forEach(([key, value]) => value !== undefined && value !== null && query.set(key, value));
-  const response = await fetch(`${path}?${query}`);
+function bounds() {
+  return $("region").value === "custom" ? customBounds : asBounds(regions[$("region").value]);
+}
+
+function areaName() {
+  return $("region").selectedOptions[0].textContent;
+}
+
+function selectedDatasets() {
+  return $("dataset").value ? [$("dataset").value] : [...new Set(coverage.map((row) => row.dataset))];
+}
+
+async function api(path, params, signal) {
+  const query = params ? `?${new URLSearchParams(params)}` : "";
+  const response = await fetch(path + query, { signal });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.detail || `${response.status} ${response.statusText}`);
+    const body = await response.json().catch(() => ({}));
+    throw new Error(typeof body.detail === "string" ? body.detail : `Request failed (${response.status})`);
   }
   return response.json();
 }
 
-function svgElement(name, attributes = {}) {
-  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
-  Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, value));
-  return node;
+function status(message, state) {
+  $("api-status").textContent = message;
+  $("api-status").dataset.state = state;
 }
 
-function project(latitude, longitude, region) {
-  const x = ((longitude - region.minLon) / (region.maxLon - region.minLon)) * 1000;
-  const y = ((region.maxLat - latitude) / (region.maxLat - region.minLat)) * 500;
-  return [x, y];
+function coordinate(value, negative, positive, digits = 1) {
+  return `${Math.abs(value).toFixed(digits)}° ${value < 0 ? negative : positive}`;
 }
 
-function drawGrid(svg, region) {
-  svg.replaceChildren();
-  for (let index = 0; index <= 5; index += 1) {
-    const x = (index / 5) * 1000;
-    const y = (index / 5) * 500;
-    svg.append(svgElement("line", { x1: x, y1: 0, x2: x, y2: 500, class: "grid-line" }));
-    svg.append(svgElement("line", { x1: 0, y1: y, x2: 1000, y2: y, class: "grid-line" }));
-    const lon = region.minLon + (index / 5) * (region.maxLon - region.minLon);
-    const lat = region.maxLat - (index / 5) * (region.maxLat - region.minLat);
-    const lonLabel = svgElement("text", { x: Math.min(960, x + 5), y: 494, class: "grid-label" });
-    lonLabel.textContent = `${lon.toFixed(0)}°`;
-    const latLabel = svgElement("text", { x: 6, y: Math.max(14, y - 5), class: "grid-label" });
-    latLabel.textContent = `${lat.toFixed(0)}°`;
-    svg.append(lonLabel, latLabel);
+function showCoordinates(lat, lon) {
+  $("map-coordinates").textContent = `${coordinate(lat, "S", "N")} · ${coordinate(lon, "W", "E")}`;
+}
+
+let googleGlobe;
+let mapLibre;
+let flatMap = false;
+let satellite = false;
+let googleLoad;
+let mapLibreStatus = "";
+let mapCells = [];
+const globe = createGlobe($("globe"), showCell, (lat, lon) => {
+  if (!googleGlobe && !mapLibre) showCoordinates(lat, lon);
+});
+const activeGlobe = () => googleGlobe ?? mapLibre ?? globe;
+
+function setCells(items) {
+  mapCells = items;
+  globe.setCells(items);
+  mapLibre?.setCells(items);
+  googleGlobe?.setCells(items);
+}
+
+function centerMaps() {
+  const area = bounds();
+  globe.center(area);
+  mapLibre?.center(area);
+  googleGlobe?.center(area);
+}
+
+function updateMapView() {
+  const google = Boolean(googleGlobe);
+  const vectorMap = Boolean(mapLibre) && !google;
+  for (const [id, visible] of [["google-globe", google], ["maplibre", vectorMap]]) {
+    $(id).inert = !visible;
+    $(id).setAttribute("aria-hidden", String(!visible));
+  }
+  $("globe").hidden = google || vectorMap;
+  $("explore").classList.toggle("google-active", google);
+  $("explore").classList.toggle("maplibre-active", vectorMap);
+  $("basemap").setAttribute("aria-pressed", String(google));
+  $("view-globe").setAttribute("aria-pressed", String(!google && !flatMap));
+  $("view-flat").setAttribute("aria-pressed", String(!google && flatMap));
+  $("style-dark").setAttribute("aria-pressed", String(vectorMap && !satellite));
+  $("style-satellite").setAttribute("aria-pressed", String(!google && (satellite || !mapLibre)));
+  $("map-attribution").hidden = !vectorMap;
+  $("nasa-attribution").hidden = !satellite;
+  $("download-visual").disabled = google;
+  $("download-visual").title = google ? "Switch to the dark map or NASA satellite to download a map PNG" : "Download map PNG";
+  if (vectorMap) mapLibre.resize();
+  activeGlobe().reportCenter?.();
+}
+
+function showLocalMap(flat) {
+  googleLoad = undefined;
+  $("basemap-status").textContent = mapLibreStatus;
+  googleGlobe?.destroy();
+  googleGlobe = undefined;
+  flatMap = flat;
+  globe.setFlat(flat);
+  mapLibre?.setFlat(flat);
+  updateMapView();
+}
+
+function selectBasemap(useSatellite) {
+  satellite = useSatellite;
+  mapLibre?.setSatellite(satellite);
+  showLocalMap(flatMap);
+}
+
+async function initMapLibre() {
+  try {
+    const { createMapLibreMap } = await import("./maplibre-map.js?v=geography");
+    mapLibre = await createMapLibreMap($("maplibre"), showCell, (lat, lon) => {
+      if (!googleGlobe) showCoordinates(lat, lon);
+    });
+    mapLibre.setFlat(flatMap);
+    mapLibre.center(bounds());
+    mapLibre.setCells(mapCells);
+    $("style-dark").disabled = false;
+    $("style-satellite").disabled = false;
+    updateMapView();
+  } catch {
+    mapLibreStatus = "Dark map unavailable. Showing bundled NASA Blue Marble.";
+    if (!googleGlobe && !googleLoad) $("basemap-status").textContent = mapLibreStatus;
   }
 }
 
-function metricValue(cell) {
-  return Number(cell[$("#metric").value] || 0);
-}
-
-function renderMap(cells, region) {
-  const svg = $("#activity-map");
-  drawGrid(svg, region);
-  if (!cells.length) return;
-  const values = cells.map(metricValue);
-  const max = Math.max(...values, 1);
-  cells.forEach((cell) => {
-    const [cx, cy] = project(cell.center_latitude, cell.center_longitude, region);
-    if (cx < 0 || cx > 1000 || cy < 0 || cy > 500) return;
-    const ratio = Math.min(1, metricValue(cell) / max);
-    const radius = 1.8 + Math.sqrt(ratio) * 10;
-    const colorIndex = ratio > 0.66 ? 2 : ratio > 0.25 ? 1 : 0;
-    const circle = svgElement("circle", {
-      cx, cy, r: radius, fill: colors[colorIndex], opacity: 0.42 + ratio * 0.48,
-      class: "cell", tabindex: 0, "aria-label": `${fmt.format(cell.detection_count)} observations`,
-    });
-    circle.addEventListener("click", () => selectCell(cell, circle));
-    circle.addEventListener("keydown", (event) => event.key === "Enter" && selectCell(cell, circle));
-    svg.append(circle);
+async function initGoogleMap() {
+  const config = await api("/map-config").catch(() => null);
+  if (!config?.googleMapsKey) return;
+  const button = $("basemap");
+  button.hidden = false;
+  const status = $("basemap-status");
+  button.addEventListener("click", async () => {
+    status.textContent = "";
+    if (googleGlobe) {
+      showLocalMap(flatMap);
+      return;
+    }
+    button.disabled = true;
+    const load = {};
+    googleLoad = load;
+    status.textContent = "Loading Google 3D…";
+    let map;
+    try {
+      const { createGoogleMap } = await import("./google-map.js?v=labels-en");
+      const initialBounds = bounds();
+      map = await createGoogleMap($("google-globe"), config.googleMapsKey, initialBounds, showCell,
+        (lat, lon) => { if (googleGlobe === map && map) showCoordinates(lat, lon); },
+        () => {
+          if (!map || googleGlobe !== map) return;
+          showLocalMap(flatMap);
+          status.textContent = "Google 3D became unavailable.";
+        });
+      if (googleLoad !== load) {
+        map.destroy();
+        return;
+      }
+      const area = bounds();
+      if (Object.keys(area).some((key) => area[key] !== initialBounds[key])) map.center(area);
+      map.setCells(mapCells);
+      googleGlobe = map;
+      updateMapView();
+      status.textContent = "";
+    } catch {
+      map?.destroy();
+      if (googleLoad === load) status.textContent = "Google 3D is unavailable. Check the Maps key, billing, or connection.";
+    } finally {
+      if (googleLoad === load) googleLoad = undefined;
+      button.disabled = false;
+    }
   });
 }
 
-function selectCell(cell, circle) {
-  document.querySelectorAll(".cell.selected").forEach((item) => item.classList.remove("selected"));
-  circle.classList.add("selected");
-  state.selectedCell = cell;
-  $("#detail-title").textContent = cell.h3_cell;
-  const values = [
-    cell.dataset, cell.platform, fmt.format(cell.detection_count),
-    `${fmt.format(cell.detections_per_km2)} / km²`, `${fmt.format(cell.frp_sum_mw)} MW`,
-    `${fmt.format(cell.cell_area_km2)} km²`, fmt.format(cell.active_days),
-  ];
-  document.querySelectorAll("#cell-details dd").forEach((item, index) => { item.textContent = values[index]; });
+function showDetails(title, values) {
+  $("selection-title").textContent = title;
+  $("selection-details").replaceChildren(...values.map(([label, value]) => {
+    const row = document.createElement("div");
+    const term = document.createElement("dt");
+    const definition = document.createElement("dd");
+    term.textContent = label;
+    definition.textContent = value;
+    row.append(term, definition);
+    return row;
+  }));
 }
 
-function renderTable(points, truncated) {
-  const body = $("#observation-rows");
-  body.replaceChildren();
-  points.forEach((point) => {
-    const row = document.createElement("tr");
-    const values = [
-      point.observation_time_utc.replace("T", " ").replace("Z", ""), point.platform,
-      Number(point.latitude).toFixed(4), Number(point.longitude).toFixed(4),
-      fmt.format(point.frp_mw), point.confidence_class, point.daynight, point.source_stage,
-    ];
-    values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); });
-    body.append(row);
+function showCell(cell) {
+  showDetails("Selected grid cell", [
+    ["Center", `${coordinate(cell.latitude, "S", "N", 3)}, ${coordinate(cell.longitude, "W", "E", 3)}`],
+    ["Detections", format(cell.detection_count)],
+    ["Days with detections", format(cell.observed_days)],
+    ["Platforms", cell.platforms.map((platform) => platformNames[platform] ?? platform).join(", ")],
+    ["Total FRP", `${format(Math.round(cell.frp_sum_mw))} MW`],
+  ]);
+  $("inspector").open = true;
+}
+
+function signatures(period, complete) {
+  const datasets = selectedDatasets();
+  return (monthCoverage.get(period) ?? []).filter((row) => datasets.includes(row.dataset)
+    && (!complete || (row.is_complete_month && row.platform_complete)))
+    .map((row) => `${row.dataset}/${row.platform}`).sort().join(",");
+}
+
+function level(value, peak) {
+  if (value == null) return "missing";
+  return value ? Math.min(4, Math.ceil(4 * Math.sqrt(value / Math.max(value, peak)))) : 0;
+}
+
+function daySpan(period, from, to) {
+  return Array.from({ length: to - from + 1 }, (_, index) => isoDay(period, from + index));
+}
+
+// Calendar weeks run Monday to Sunday and stop at the edges of the visible month.
+function weekOf(date) {
+  const period = date.slice(0, 7);
+  const { first, days } = dates(period);
+  const number = Number(date.slice(8));
+  const monday = number - (number - 1 + weekOffset(first)) % 7;
+  return daySpan(period, Math.max(1, monday), Math.min(days, monday + 6));
+}
+
+function isRun() {
+  return Number(selected.at(-1).slice(8)) - Number(selected[0].slice(8)) === selected.length - 1;
+}
+
+function selectionLabel() {
+  if (!selected.length) return null;
+  const first = new Date(selected[0]);
+  if (selected.length === 1) return dayFormat.format(first);
+  const month = monthNames[first.getUTCMonth()];
+  return isRun()
+    ? `${month} ${first.getUTCDate()}–${Number(selected.at(-1).slice(8))}, ${first.getUTCFullYear()}`
+    : `${selected.length} days in ${month}`;
+}
+
+function selectionSlug() {
+  if (!selected.length) return selectedPeriod;
+  if (selected.length === 1) return selected[0];
+  return isRun() ? `${selected[0]}_to_${selected.at(-1)}` : `${selectedPeriod}-${selected.length}-days`;
+}
+
+function drawCalendar() {
+  const period = selectedPeriod;
+  const { first, days } = dates(period);
+  const offset = weekOffset(first);
+  $("calendar-month").textContent = selectionLabel() ?? monthFormat.format(first);
+  const byDate = new Map(calendar.map((row) => [row.date, row]));
+  const peak = Math.max(1, ...calendar.map((row) => row.active_cell_days));
+  const fragment = document.createDocumentFragment();
+  for (let i = 1; i <= days; i++) {
+    const date = isoDay(period, i);
+    const button = document.createElement("button");
+    const position = i - 1 + offset;
+    button.dataset.date = date;
+    button.dataset.week = Math.floor(position / 7);
+    if (i > 1 && position % 7 === 0) button.className = "week-start";
+    const data = byDate.get(date);
+    const count = data?.active_cell_days;
+    button.type = "button";
+    button.textContent = i;
+    button.dataset.level = level(count, peak);
+    if (count) {
+      const intensity = Math.sqrt(count / peak);
+      button.style.setProperty("--bar", `${3 + 19 * intensity}px`);
+      button.style.setProperty("--strength", .4 + .6 * intensity);
+    }
+    button.setAttribute("aria-pressed", selected.includes(date));
+    button.setAttribute("aria-label", `${weekdayFormat.format(new Date(date))} ${date}, ${count == null ? "no eligible records or coverage unknown" : format(count) + " active cells"}`);
+    button.title = button.getAttribute("aria-label");
+    button.addEventListener("click", (event) => pickDay(date, event.shiftKey));
+    fragment.append(button);
+  }
+  $("days").replaceChildren(fragment);
+  $("whole-month").disabled = !selected.length;
+  $("whole-month").hidden = !selected.length;
+  $("download-calendar").disabled = !calendar.length;
+}
+
+function drawSelection() {
+  const rows = selected.length ? calendar.filter((row) => selected.includes(row.date)) : calendar;
+  const total = (key) => format(rows.reduce((sum, row) => sum + row[key], 0));
+  const sources = (monthCoverage.get(selectedPeriod) ?? []).map((row) => row.dataset);
+  showDetails(selectionLabel() ?? "Month overview", rows.length ? [
+    [selected.length === 1 ? "Active cells" : "Active cell-days", total("active_cell_days")],
+    ...selectedDatasets().filter((key) => sources.includes(key)).map((key) => [datasets[key] + " detections", total(key)]),
+    ...(sources.includes("modis") && sources.some((key) => key !== "modis") && !$("dataset").value
+      ? [["MODIS + VIIRS overlaps", total("shared_cell_days")]] : []),
+  ] : [["Activity", "No eligible records"]]);
+}
+
+function pickDay(date, extend) {
+  if (mode === "week") {
+    selected = weekOf(date);
+  } else if (mode === "days") {
+    const next = new Set(selected);
+    if (extend && rangeAnchor) {
+      const [from, to] = [rangeAnchor, date].map((value) => Number(value.slice(8))).sort((a, b) => a - b);
+      daySpan(selectedPeriod, from, to).forEach((value) => next.add(value));
+    } else if (!next.delete(date)) {
+      next.add(date);
+    }
+    selected = [...next].sort();
+    rangeAnchor = date;
+  } else {
+    selected = [date];
+  }
+  applySelection(date);
+}
+
+function applySelection(focusDate) {
+  const focused = focusDate && $("days").contains(document.activeElement);
+  drawCalendar();
+  if (focused) $("days").querySelector(`[data-date="${focusDate}"]`)?.focus();
+  drawSelection();
+  loadMap();
+}
+
+function setMode(next) {
+  mode = next;
+  $("days").dataset.mode = next;
+  document.querySelectorAll(".calendar-modes button").forEach((button) => button.setAttribute("aria-pressed", button.dataset.mode === next));
+  if (!selected.length) return;
+  const before = selected.join();
+  if (next === "week") selected = weekOf(selected[0]);
+  if (next === "day") selected = [selected[0]];
+  rangeAnchor = selected[0];
+  if (selected.join() !== before) applySelection();
+}
+
+function highlightWeek(week) {
+  for (const button of $("days").children) button.classList.toggle("peer", week !== undefined && button.dataset.week === week);
+}
+
+async function loadMap() {
+  mapRequest?.abort();
+  const request = new AbortController();
+  mapRequest = request;
+  const { start, end } = dates(selectedPeriod);
+  const params = new URLSearchParams({
+    ...bounds(), ...sensorParam(), start_date: selected[0] ?? start, end_date: selected.at(-1) ?? end,
   });
-  $("#table-note").textContent = truncated
-    ? "Showing the first 100 matching point observations; more are available."
-    : `Showing all ${points.length} matching point observations.`;
+  if (selected.length && !isRun()) {
+    for (const day of selected) params.append("days", day);
+  }
+  $("download-points").disabled = true;
+  $("map-key-label").textContent = "";
+  $("map-message").textContent = "Loading map observations…";
+  setCells([]);
+  try {
+    const { data, cell_size: size } = await api("/v1/spatial/grid", params, request.signal);
+    if (request.signal.aborted) return;
+    setCells(data.map((row) => {
+      const strength = Math.min(1, Math.log2(row.detection_count) / 8);
+      const red = Math.round(133 + 122 * strength);
+      const green = Math.round(59 + 114 * strength);
+      const blue = Math.round(30 + 75 * strength);
+      const color = `rgba(${red}, ${green}, ${blue}, ${.72 + .2 * strength})`;
+      return { ...row, size, color, latitude: row.south + size / 2, longitude: row.west + size / 2 };
+    }));
+    $("download-points").disabled = !data.length;
+    $("map-key-label").textContent = `${size}° grid · brighter = more detections`;
+    $("map-message").textContent = data.length ? "" : "No mapped observations for this selection";
+  } catch (error) {
+    if (!request.signal.aborted) $("map-message").textContent = error.message;
+  }
 }
 
-function renderTrend(rows) {
-  const svg = $("#trend-chart");
-  svg.replaceChildren();
+async function loadAnomaly(period, bbox, rows, signal) {
+  const year = Number(period.slice(0, 4));
+  const month = Number(period.slice(5));
+  const active = signatures(period, false);
+  if (!rows.length || !active || active !== signatures(period, true)) return;
+  const prior = [];
+  for (let y = Math.max(2000, year - 5); y < year; y++) {
+    const previous = `${y}-${period.slice(5)}`;
+    if (signatures(previous, false) === active && signatures(previous, true) === active) {
+      prior.push(dates(previous));
+    }
+  }
+  if (prior.length < 2) return;
+  const historic = await api("/v1/calendar", {
+    ...bbox, ...sensorParam(), interval: "month", month, start_date: prior[0].start, end_date: prior.at(-1).end,
+  }, signal);
+  if (signal.aborted) return;
+  const matching = new Set(prior.map((span) => span.start));
+  const values = historic.data.filter((row) => matching.has(row.date)).map((row) => row.active_cell_days).sort((a, b) => a - b);
+  if (values.length < 2) return;
+  const median = (values[Math.floor((values.length - 1) / 2)] + values[Math.ceil((values.length - 1) / 2)]) / 2;
+  if (!median) return;
+  const delta = (rows.reduce((sum, row) => sum + row.active_cell_days, 0) - median) / median;
+  $("anomaly").textContent = new Intl.NumberFormat("en", { style: "percent", signDisplay: "exceptZero" }).format(delta);
+  $("anomaly").title = `Median of ${values.length} previous ${monthNames[month - 1]} values: ${format(median)} cell-days`;
+}
+
+function sensorParam() {
+  return $("dataset").value ? { dataset: $("dataset").value } : {};
+}
+
+async function loadSelection() {
+  selectionRequest?.abort();
+  const request = new AbortController();
+  selectionRequest = request;
+  const period = selectedPeriod;
+  $("previous").disabled = !firstPeriod || period <= firstPeriod;
+  $("next").disabled = !lastPeriod || period >= lastPeriod;
+  const bbox = bounds();
+  const { start, end } = dates(period);
+  $("area-name").textContent = areaName();
+  $("history-area").textContent = areaName() + " · " + $("dataset").selectedOptions[0].textContent;
+  selected = [];
+  rangeAnchor = null;
+  calendar = [];
+  drawCalendar();
+  $("activity").textContent = "—";
+  $("anomaly").textContent = "—";
+  $("anomaly").removeAttribute("title");
+  $("coverage-note").textContent = "Loading calendar…";
+  showDetails("Month overview", []);
+  if (view === "history") loadHistory();
+  loadMap();
+  try {
+    const response = await api("/v1/calendar", { ...bbox, ...sensorParam(), start_date: start, end_date: end }, request.signal);
+    if (request.signal.aborted) return;
+    calendar = response.data;
+    drawCalendar();
+    drawSelection();
+    $("activity").textContent = calendar.length ? format(calendar.reduce((sum, row) => sum + row.active_cell_days, 0)) : "—";
+    const active = signatures(period, false);
+    const full = signatures(period, true);
+    $("coverage-note").textContent = !active ? "No archive coverage for this month."
+      : active !== full ? "Partial instrument coverage. This month is excluded from median comparisons."
+      : calendar.length ? "" : "No qualifying detections in this area.";
+    if (active && !$("dataset").value) {
+      const present = new Set((monthCoverage.get(period) ?? []).map((row) => row.dataset));
+      const missing = selectedDatasets().filter((key) => !present.has(key));
+      if (missing.length) {
+        const existing = $("coverage-note").textContent;
+        $("coverage-note").textContent = [existing, "Missing this month: " + missing.map((key) => datasets[key]).join(", ") + "."].filter(Boolean).join(" ");
+      }
+    }
+    await loadAnomaly(period, bbox, calendar, request.signal);
+  } catch (error) {
+    if (!request.signal.aborted) $("coverage-note").textContent = calendar.length ? "Historical comparison unavailable." : error.message;
+  }
+}
+
+function selectPeriod(period) {
+  if (!firstPeriod || period < firstPeriod || period > lastPeriod) return false;
+  selectedPeriod = period;
+  const [year, month] = period.split("-");
+  const picker = $("period-month");
+  if (picker.dataset.year !== year) {
+    const options = [];
+    for (let index = 0; index < 12; index++) {
+      const value = String(index + 1).padStart(2, "0");
+      const candidate = `${year}-${value}`;
+      if (candidate < firstPeriod || candidate > lastPeriod) continue;
+      options.push(new Option(monthLabel.format(new Date(Date.UTC(Number(year), index, 1))), value));
+    }
+    picker.replaceChildren(...options);
+    picker.dataset.year = year;
+  }
+  picker.value = month;
+  $("period-year").value = year;
+  return true;
+}
+
+function shiftMonth(delta) {
+  const { first } = dates(selectedPeriod);
+  first.setUTCMonth(first.getUTCMonth() + delta);
+  if (selectPeriod(first.toISOString().slice(0, 7))) loadSelection();
+}
+
+function csvDownload(filename, rows, columns = Object.keys(rows[0] ?? {})) {
   if (!rows.length) return;
-  const grouped = rows.reduce((result, row) => {
-    (result[row.platform] ||= []).push(row);
-    return result;
-  }, {});
-  const platforms = Object.keys(grouped);
-  const allValues = rows.map((row) => Number(row.detection_count));
-  const max = Math.max(...allValues, 1);
-  const xFor = (year, month) => {
-    const serial = year * 12 + month;
-    const serials = rows.map((row) => row.year * 12 + row.month);
-    return 65 + ((serial - Math.min(...serials)) / Math.max(1, Math.max(...serials) - Math.min(...serials))) * 900;
-  };
-  const yFor = (value) => 255 - (value / max) * 210;
-  svg.append(svgElement("line", { x1: 65, y1: 255, x2: 965, y2: 255, class: "axis" }));
-  svg.append(svgElement("line", { x1: 65, y1: 35, x2: 65, y2: 255, class: "axis" }));
-  [0, .5, 1].forEach((ratio) => {
-    const label = svgElement("text", { x: 8, y: yFor(max * ratio) + 4, class: "axis-label" });
-    label.textContent = fmt.format(max * ratio);
-    svg.append(label);
-  });
-  platforms.forEach((platform, platformIndex) => {
-    const points = grouped[platform].sort((a, b) => (a.year * 12 + a.month) - (b.year * 12 + b.month));
-    const color = colors[platformIndex % colors.length];
-    const path = points.map((row, index) => `${index ? "L" : "M"}${xFor(row.year, row.month)},${yFor(row.detection_count)}`).join(" ");
-    svg.append(svgElement("path", { d: path, stroke: color, class: "trend-line" }));
-    points.forEach((row) => svg.append(svgElement("circle", { cx: xFor(row.year, row.month), cy: yFor(row.detection_count), r: 4, fill: color, class: "trend-dot" })));
-    const label = svgElement("text", { x: 78 + platformIndex * 120, y: 20, fill: color, class: "axis-label" });
-    label.textContent = platform;
-    svg.append(label);
-  });
+  const quote = (value) => '"' + String(value ?? "").replaceAll('"', '""') + '"';
+  const content = [columns.map(quote).join(","), ...rows.map((row) => columns.map((key) => quote(row[key])).join(","))].join("\r\n");
+  download(filename, new Blob([content], { type: "text/csv;charset=utf-8" }));
 }
 
-function updatePeriod(monthRows) {
-  if (!monthRows.length) {
-    $("#period-status").textContent = "No coverage";
-    $("#period-detail").textContent = "No aggregate row for this selection";
+function download(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function downloadPoints() {
+  const button = $("download-points");
+  const signal = mapRequest.signal;
+  const period = selectedPeriod;
+  const days = selected;
+  const slug = selectionSlug();
+  const { start, end } = dates(period);
+  const bbox = bounds();
+  const limit = Math.min(5000, Math.floor(35000 / Math.max(1, days.length)));
+  const spans = days.length ? days.map((day) => ({ start_date: day, end_date: day })) : [{ start_date: start, end_date: end }];
+  button.disabled = true;
+  try {
+    const pages = await Promise.all(selectedDatasets().flatMap((dataset) => spans.map((span) =>
+      api("/v1/hotspots", { ...bbox, dataset, ...span, limit }, signal))));
+    if (signal.aborted) return;
+    const rows = pages.flatMap((page) => page.data);
+    if (rows.length) csvDownload(`firms-${slug}-hotspots${pages.some((page) => page.truncated) ? "-limited-per-sensor" : ""}.csv`, rows);
+    else $("map-message").textContent = "No hotspot rows to export";
+  } catch (error) {
+    if (!signal.aborted) $("map-message").textContent = error.message;
+  } finally {
+    if (!signal.aborted) button.disabled = false;
+  }
+}
+
+async function loadHistory() {
+  historyRequest?.abort();
+  const request = new AbortController();
+  historyRequest = request;
+  const from = $("history-start").value;
+  const to = $("history-end").value;
+  const table = $("history-table");
+  const note = $("history-note");
+  table.replaceChildren();
+  $("download-history").disabled = true;
+  historyRows = [];
+  if (!from || !to || from > to) {
+    note.textContent = "Choose a valid month range.";
     return;
   }
-  const complete = monthRows.every((row) => row.is_complete_month);
-  $("#period-status").textContent = complete ? "Complete month" : "Partial month";
-  $("#period-detail").textContent = monthRows.map((row) => `${row.platform}: ${row.active_days} active days`).join(" · ");
-}
-
-async function loadDashboard() {
-  const dataset = $("#dataset").value;
-  const selectedMonth = monthDates($("#month").value);
-  const region = regions[$("#region").value];
-  const resolution = $("#resolution").value;
-  $("#error-message").textContent = "";
-  $("#map-loading").classList.remove("hidden");
-  $("#refresh").disabled = true;
+  const bbox = bounds();
+  const params = sensorParam();
+  note.textContent = "Loading monthly activity…";
   try {
-    const bbox = { min_lat: region.minLat, max_lat: region.maxLat, min_lon: region.minLon, max_lon: region.maxLon };
-    const [spatial, points, monthly] = await Promise.all([
-      getJson("/v1/spatial/monthly", { resolution, dataset, year: selectedMonth.year, month: selectedMonth.month, ...bbox, limit: 2500 }),
-      getJson("/v1/hotspots", { dataset, start_date: selectedMonth.start, end_date: selectedMonth.end, ...bbox, limit: 100 }),
-      getJson("/v1/activity/monthly", { dataset, limit: 100 }),
-    ]);
-    state.cells = spatial.data;
-    renderMap(state.cells, region);
-    renderTable(points.data, points.truncated);
-    renderTrend(monthly.data);
-    updatePeriod(monthly.data.filter((row) => row.year === selectedMonth.year && row.month === selectedMonth.month));
-    $("#cell-count").textContent = fmt.format(spatial.count);
-    $("#cell-truncation").textContent = spatial.truncated ? "Result capped at 2,500 cells" : "All matching occupied cells";
-    $("#point-count").textContent = fmt.format(points.count);
-    $("#point-truncation").textContent = points.truncated ? "More observations available" : "All matching observations";
-    $("#map-title").textContent = `${region.label} · ${$("#month").value}`;
+    // Query one calendar year at a time to stay within the API's bounded scan.
+    const firstYear = Number(from.slice(0, 4));
+    const lastYear = Number(to.slice(0, 4));
+    const rows = [];
+    for (let year = lastYear; year >= firstYear; year--) {
+      const start = year === firstYear ? dates(from).start : `${year}-01-01`;
+      const end = year === lastYear ? dates(to).end : `${year}-12-31`;
+      if (!monthNames.some((_, index) => {
+        const period = `${year}-${String(index + 1).padStart(2, "0")}`;
+        return period >= from && period <= to && signatures(period, false);
+      })) continue;
+      const result = await api("/v1/calendar", { ...bbox, ...params, start_date: start, end_date: end, interval: "month" }, request.signal);
+      rows.push(...result.data);
+    }
+    if (request.signal.aborted) return;
+    historyRows = rows.sort((a, b) => a.date.localeCompare(b.date));
+    $("download-history").disabled = !rows.length;
+    note.textContent = rows.length ? "Select a month to inspect it. Hatched months have no eligible records. Satellite coverage can change across months." : "No eligible records in this range.";
+    const index = new Map(rows.map((row) => [row.date.slice(0, 7), row.active_cell_days]));
+    const peak = Math.max(1, ...index.values());
+    const header = table.createTHead().insertRow();
+    for (const name of ["Year", ...monthNames]) {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      cell.textContent = name;
+      header.append(cell);
+    }
+    const body = table.createTBody();
+    for (let year = lastYear; year >= firstYear; year--) {
+      const row = body.insertRow();
+      const yearCell = document.createElement("th");
+      yearCell.scope = "row";
+      yearCell.textContent = year;
+      row.append(yearCell);
+      monthNames.forEach((name, i) => {
+        const period = `${year}-${String(i + 1).padStart(2, "0")}`;
+        const cell = row.insertCell();
+        if (period < from || period > to) return;
+        const count = index.get(period);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "history-cell";
+        button.dataset.level = level(count, peak);
+        button.textContent = count == null ? "—" : format(count);
+        const active = signatures(period, false);
+        const satelliteNames = (monthCoverage.get(period) ?? []).filter((item) => selectedDatasets().includes(item.dataset))
+          .map((item) => platformNames[item.platform] ?? item.platform);
+        const partial = active !== signatures(period, true);
+        button.setAttribute("aria-label", `${name} ${year}: ${count == null ? "no eligible records" : format(count) + " active cell-days"}`);
+        if (active) button.title = satelliteNames.join(", ") + (partial ? " · partial coverage" : "");
+        button.addEventListener("click", () => {
+          if (!selectPeriod(period)) return;
+          setView("explore");
+          loadSelection();
+        });
+        cell.append(button);
+      });
+    }
   } catch (error) {
-    $("#error-message").textContent = `Unable to load the selected data: ${error.message}`;
-  } finally {
-    $("#map-loading").classList.add("hidden");
-    $("#refresh").disabled = false;
+    if (!request.signal.aborted) note.textContent = error.message;
   }
 }
 
-async function initialize() {
+function setView(next) {
+  view = next;
+  if (next !== "explore") closeMenus.forEach((close) => close?.());
+  $("explore").hidden = next !== "explore";
+  $("history").hidden = next !== "history";
+  document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.view === next));
+  if (next === "history") loadHistory();
+  else mapLibre?.resize();
+}
+
+async function init() {
+  $("download-points").disabled = true;
+  $("download-calendar").disabled = true;
+  $("download-history").disabled = true;
+  $("whole-month").disabled = true;
   try {
-    const health = await getJson("/health");
-    $("#api-status").classList.add("online");
-    $("#api-status").innerHTML = `<span></span> ${fmt.format(health.source_rows)} validated observations`;
-    await loadDashboard();
+    const [health, page, months] = await Promise.all([api("/health"), api("/v1/coverage"), api("/v1/coverage/monthly")]);
+    coverage = page.data;
+    for (const row of months.data) {
+      const period = row.month_start.slice(0, 7);
+      if (!monthCoverage.has(period)) monthCoverage.set(period, []);
+      monthCoverage.get(period).push(row);
+    }
+    if (!coverage.length) throw new Error("The archive contains no usable coverage.");
+    areaLabel = health.area_label;
+    status(areaLabel ? areaLabel + " archive" : "FIRMS connected", "ready");
+    for (const [key, name] of Object.entries(datasets)) {
+      if (coverage.some((row) => row.dataset === key)) $("dataset").add(new Option(name, key));
+    }
+    const first = coverage.map((row) => row.first_date).sort()[0].slice(0, 7);
+    const latest = coverage.map((row) => row.last_date).sort().at(-1).slice(0, 7);
+    for (const id of ["history-start", "history-end"]) {
+      $(id).min = first;
+      $(id).max = latest;
+    }
+    firstPeriod = first;
+    lastPeriod = latest;
+    const yearOptions = document.createDocumentFragment();
+    for (let year = Number(latest.slice(0, 4)); year >= Number(first.slice(0, 4)); year--) {
+      yearOptions.append(new Option(String(year)));
+    }
+    $("period-year").replaceChildren(yearOptions);
+    selectPeriod(areaLabel && monthCoverage.has("2025-02") ? "2025-02" : latest);
+    $("period-month").disabled = false;
+    $("period-year").disabled = false;
+    $("history-start").value = first;
+    $("history-end").value = latest;
+    loadSelection();
   } catch (error) {
-    $("#api-status").classList.add("offline");
-    $("#api-status").innerHTML = "<span></span> API unavailable";
-    $("#error-message").textContent = error.message;
+    status("Archive unavailable", "error");
+    $("coverage-note").textContent = error.message;
+    $("map-message").textContent = "Connect a validated FIRMS archive to view observations.";
   }
 }
 
-$("#refresh").addEventListener("click", loadDashboard);
-$("#region").addEventListener("change", (event) => {
-  $("#resolution").value = event.target.value === "global" ? "4" : "5";
+$("region").addEventListener("change", () => {
+  $("bounds").hidden = $("region").value !== "custom";
+  centerMaps();
+  loadSelection();
 });
-$("#metric").addEventListener("change", () => renderMap(state.cells, regions[$("#region").value]));
-initialize();
+$("bounds").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const data = Object.fromEntries([...new FormData(event.target)].map(([key, value]) => [key, Number(value)]));
+  if (data.max_lat < data.min_lat) {
+    $("coverage-note").textContent = "North latitude must be greater than or equal to south latitude.";
+    return;
+  }
+  customBounds = data;
+  centerMaps();
+  loadSelection();
+});
+$("dataset").addEventListener("change", loadSelection);
+$("period-month").addEventListener("change", () => {
+  if (selectPeriod(`${$("period-year").value}-${$("period-month").value}`)) loadSelection();
+});
+$("period-year").addEventListener("change", () => {
+  const period = `${$("period-year").value}-${selectedPeriod.slice(5)}`;
+  const next = period < firstPeriod ? firstPeriod : period > lastPeriod ? lastPeriod : period;
+  if (selectPeriod(next)) loadSelection();
+});
+$("previous").addEventListener("click", () => shiftMonth(-1));
+$("next").addEventListener("click", () => shiftMonth(1));
+$("whole-month").addEventListener("click", () => {
+  selected = [];
+  rangeAnchor = null;
+  applySelection();
+  $("days").querySelector("button")?.focus();
+});
+document.querySelectorAll(".calendar-modes button").forEach((button) => button.addEventListener("click", () => setMode(button.dataset.mode)));
+for (const type of ["pointerover", "focusin"]) {
+  $("days").addEventListener(type, (event) => highlightWeek(mode === "week" ? event.target.dataset?.week : undefined));
+}
+for (const type of ["pointerleave", "focusout"]) $("days").addEventListener(type, () => highlightWeek());
+$("view-globe").addEventListener("click", () => showLocalMap(false));
+$("view-flat").addEventListener("click", () => showLocalMap(true));
+$("style-dark").addEventListener("click", () => selectBasemap(false));
+$("style-satellite").addEventListener("click", () => selectBasemap(true));
+$("zoom-in").addEventListener("click", () => activeGlobe().changeZoom(1.35));
+$("zoom-out").addEventListener("click", () => activeGlobe().changeZoom(1 / 1.35));
+$("recenter").addEventListener("click", centerMaps);
+$("about").addEventListener("click", () => $("methodology").showModal());
+$("history-form").addEventListener("submit", (event) => { event.preventDefault(); loadHistory(); });
+$("download-calendar").addEventListener("click", () => csvDownload(`firms-${selectedPeriod}-calendar.csv`, calendar));
+$("download-points").addEventListener("click", downloadPoints);
+$("download-history").addEventListener("click", () => csvDownload("firms-monthly-history.csv", historyRows));
+$("download-visual").addEventListener("click", () => {
+  const filename = `firms-${selectionSlug()}-map.png`;
+  activeGlobe().exportImage?.((blob) => {
+    if (blob) download(filename, blob);
+  });
+});
+document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
+
+init();
+initMapLibre();
+initGoogleMap();
