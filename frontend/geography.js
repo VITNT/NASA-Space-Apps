@@ -1,4 +1,3 @@
-// Geography format and map styles adapted from Project SHIFT (Apache 2.0).
 // See assets/geography for the geography sources and licenses.
 import "./assets/geography/topojson-client.js";
 import { coastLines, landForMap } from "./assets/geography/coast.js";
@@ -46,8 +45,21 @@ function boundaryLayer(id, source, minzoom, color, width, dash) {
   };
 }
 
+let countryTopology;
+const countries = () => countryTopology ??= readGeo("countries-50m.json");
+
+// A country's border as lines of [longitude, latitude], for outlining it as
+// the selected area. Empty when the name is unknown.
+export async function countryLines(name) {
+  const topology = await countries();
+  const geometry = topology.objects.countries.geometries.find((item) => item.properties.name === name);
+  if (!geometry) return [];
+  const { type, coordinates } = globalThis.topojson.feature(topology, geometry).geometry;
+  return (type === "MultiPolygon" ? coordinates : [coordinates]).flat();
+}
+
 export async function loadBasemap() {
-  const [topology, { scale, l, places }] = await Promise.all([readGeo("countries-50m.json"), readGeo("world.json")]);
+  const [topology, { scale, l, places }] = await Promise.all([countries(), readGeo("world.json")]);
   const land = landForMap(globalThis.topojson.feature(topology, topology.objects.countries));
   const world = collection([
     ...unpackLines(l, scale, { k: "border" }),

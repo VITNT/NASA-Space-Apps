@@ -1,5 +1,8 @@
 import { createGlobe } from "./globe.js";
-import { loadTerraModel } from "./terra-model.js";
+import { createSatelliteModel } from "./satellite-model.js";
+import {
+  kmPerDegree, nightCrossing, orbit, satelliteOrder, satellites, swathHalfWidth, trackHeading,
+} from "./satellites.js";
 
 const radians = Math.PI / 180;
 const compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
@@ -105,8 +108,31 @@ export function stepFlight(state, input, dt, zoom) {
   }
 }
 
+const numberFormat = new Intl.NumberFormat("en");
+const monthYear = new Intl.DateTimeFormat("en", { month: "short", year: "numeric", timeZone: "UTC" });
+
+// The instrument and orbit facts a reader needs to interpret one satellite's detections.
+function specRows(satellite, archive) {
+  const { periodMin } = orbit(satellite);
+  const night = satellite.dayPass === "ascending" ? "descending" : "ascending";
+  const rows = [
+    ["Instrument", `${satellite.instrument} · ${satellite.product}`],
+    ["Orbit", `Sun-synchronous · ${satellite.altitudeKm} km · ${satellite.inclination}° · ${periodMin.toFixed(1)} min`],
+    ["Equator crossing", `${satellite.crossing} ${satellite.dayPass} (day) · ${nightCrossing(satellite)} ${night} (night), local solar time`],
+    ["Swath", `${numberFormat.format(satellite.swathKm)} km`],
+    ["Fire pixel", `${satellite.nadirPixel} at nadir, ${satellite.edgePixel} at swath edge`],
+    ["Fire channels", satellite.bands],
+  ];
+  if (archive) {
+    const month = (date) => monthYear.format(new Date(`${date}T00:00:00Z`));
+    rows.push(["In this archive", `${month(archive.first)} – ${month(archive.last)}`]);
+  }
+  return rows;
+}
+
 // `layer` supplies the activity the explore globe shows: a title for the current
-// selection, a query for a camera's view, and a description of a selected cell.
+// selection, the satellites of the selected record, a query for a camera's view
+// (optionally for one satellite), and a description of a selected cell.
 export function createSatelliteFlight(root, layer, onExit) {
   const get = (id) => root.querySelector(`#${id}`);
   const canvas = get("flight-globe");
@@ -117,9 +143,17 @@ export function createSatelliteFlight(root, layer, onExit) {
   const heading = get("flight-heading");
   const speedReadout = get("flight-speed");
   const craft = root.querySelector(".flight-craft");
-  const terraCanvas = get("flight-terra");
+  const modelCanvas = get("flight-model");
   const fallbackCraft = craft.querySelector(".flight-craft-model");
   const modelCredit = get("flight-model-credit");
+  const picker = get("flight-satellites");
+  const specCard = get("flight-spec-card");
+  const spec = get("flight-spec");
+  const specNote = get("flight-spec-note");
+  const passRow = get("flight-pass-row");
+  const passReadout = get("flight-pass");
+  const swathButton = get("flight-swath");
+  const orbitButton = get("flight-orbit");
   const buttons = [...root.querySelectorAll("[data-flight-control]")];
   const globe = createGlobe(canvas, () => {}, () => {}, () => {}, { pilot: true });
   const pressed = new Map();
@@ -138,21 +172,113 @@ export function createSatelliteFlight(root, layer, onExit) {
   let lastKey;
   let request;
   let timer;
+  // The satellite being flown (a key of `satellites`), or undefined for every
+  // satellite of the record. Following, the craft keeps to its ground track.
+  let platform;
+  let following = false;
+  let ascending = true;
+  let showSwath = true;
   const cellCache = new Map();
-  loadTerraModel(terraCanvas).then((loaded) => {
-    if (!loaded) return;
-    model = loaded;
-    terraCanvas.hidden = false;
-    modelCredit.hidden = false;
-    fallbackCraft.hidden = true;
-    invalidate();
-  }).catch((error) => console.warn("Terra model:", error.message));
-  terraCanvas.addEventListener("webglcontextlost", () => {
+  let modelView;
+  try {
+    modelView = createSatelliteModel(modelCanvas);
+  } catch (error) {
+    console.warn("Spacecraft model:", error.message);
+  }
+  modelCanvas.addEventListener("webglcontextlost", () => {
+    modelView = undefined;
+    showModel();
+  });
+
+  // Draws the chosen satellite's NASA model, or the generic craft when there
+  // is none. Every satellite of the record together flies as Terra.
+  function showModel() {
+    const source = satellites[platform ?? "terra"].model;
     model = undefined;
-    terraCanvas.hidden = true;
+    modelCanvas.hidden = true;
     modelCredit.hidden = true;
     fallbackCraft.hidden = false;
-  });
+    if (!source || !modelView) return;
+    modelView.show(source).then((ready) => {
+      if (!ready || satellites[platform ?? "terra"].model !== source) return;
+      model = modelView;
+      modelCanvas.hidden = false;
+      fallbackCraft.hidden = true;
+      const link = Object.assign(document.createElement("a"), {
+        href: source.source, target: "_blank", rel: "noopener", textContent: source.author,
+      });
+      modelCredit.replaceChildren(`${source.credit} · `, link);
+      modelCredit.hidden = false;
+      invalidate();
+    }).catch((error) => console.warn("Spacecraft model:", error.message));
+  }
+
+  function selectSatellite(key) {
+    platform = key;
+    for (const button of picker.children) button.setAttribute("aria-pressed", String(button.dataset.platform === (key ?? "")));
+    const satellite = satellites[key];
+    specCard.hidden = !satellite;
+    swathButton.disabled = orbitButton.disabled = !satellite;
+    if (satellite) {
+      const archive = layer.satellites().find((item) => item.key === key)?.archive;
+      spec.replaceChildren(...specRows(satellite, archive).map(([term, value]) => {
+        const row = document.createElement("div");
+        row.append(Object.assign(document.createElement("dt"), { textContent: term }),
+          Object.assign(document.createElement("dd"), { textContent: value }));
+        return row;
+      }));
+      specNote.textContent = satellite.note;
+    }
+    setFollowing(following && !!satellite);
+    showModel();
+    lastKey = undefined;
+    detail.hidden = true;
+    invalidate();
+  }
+
+  // The record's satellites, each available when it observed the selected month.
+  function buildPicker() {
+    const items = layer.satellites();
+    const choices = items.length > 1 ? [{ key: undefined, available: true }, ...items] : items;
+    picker.replaceChildren(...choices.map(({ key, available }) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.platform = key ?? "";
+      button.textContent = key ? satellites[key].name : "All";
+      button.disabled = !available;
+      button.title = !key ? "Every satellite of the selected record"
+        : available ? `${satellites[key].name} · ${satellites[key].instrument} only`
+        : `${satellites[key].name} has no data in the selected month`;
+      button.addEventListener("click", () => selectSatellite(key));
+      return button;
+    }));
+    const keep = items.find((item) => item.key === platform && item.available);
+    selectSatellite(keep ? platform : items.length === 1 && items[0].available ? items[0].key : undefined);
+  }
+
+  function setFollowing(next) {
+    following = next;
+    orbitButton.setAttribute("aria-pressed", String(following));
+    passRow.hidden = !following;
+    if (following) {
+      state.turnRate = state.slide = 0;
+      // Start on the daytime pass, the one most detections come from.
+      ascending = satellites[platform].dayPass === "ascending";
+      if (Math.abs(state.lat) >= orbit(satellites[platform]).turnLatitude - .05) ascending = state.lat < 0;
+      state.heading = trackHeading(satellites[platform], state.lat, ascending);
+      invalidate();
+    }
+  }
+
+  // Keeps the craft on its ground track, turning onto the other pass where the
+  // orbit reaches its highest latitude.
+  function holdTrack() {
+    const satellite = satellites[platform];
+    const poleward = Math.cos(state.heading * radians) * state.speed * state.lat > 0;
+    if (poleward && Math.abs(state.lat) >= orbit(satellite).turnLatitude - .05) ascending = !ascending;
+    state.heading = trackHeading(satellite, state.lat, ascending);
+    state.turnRate = state.slide = 0;
+  }
 
   function isHeld(control) {
     for (const value of pressed.values()) if (value === control) return true;
@@ -170,7 +296,8 @@ export function createSatelliteFlight(root, layer, onExit) {
 
   function showCells({ items, dots, label }) {
     globe.setCells(items, dots);
-    dataStatus.textContent = items.length ? label : "No mapped observations in this view";
+    const only = platform ? ` · ${satellites[platform].name} only` : "";
+    dataStatus.textContent = items.length ? label + only : `No mapped ${platform ? satellites[platform].name + " " : ""}observations in this view`;
   }
 
   function clearInput() {
@@ -197,7 +324,7 @@ export function createSatelliteFlight(root, layer, onExit) {
     timer = undefined;
     const camera = active && globe.getViewport();
     if (!camera) return;
-    const { key, load } = layer.query(camera);
+    const { key, load } = layer.query(camera, platform);
     if (key === lastKey) return;
     lastKey = key;
     request?.abort();
@@ -233,6 +360,9 @@ export function createSatelliteFlight(root, layer, onExit) {
     const lead = globe.lead(craftY, zoom);
     const camera = destination(state, state.heading, lead);
     const forward = destination(state, state.heading, lead + .1);
+    const satellite = satellites[platform];
+    globe.setSwath(satellite && showSwath
+      ? { lat: state.lat, lon: state.lon, heading: state.heading, halfWidth: swathHalfWidth(satellite) } : null);
     globe.setCamera(camera.lat, camera.lon, zoom, bearingFrom(camera, forward));
     craft.style.setProperty("--flight-bank", `${bank.toFixed(1)}deg`);
     craft.style.setProperty("--flight-shift", `${bank.toFixed(1)}px`);
@@ -240,7 +370,18 @@ export function createSatelliteFlight(root, layer, onExit) {
     position.textContent = positionLabel(state);
     heading.textContent = `${Math.round(state.heading) % 360}° ${compass[Math.round(state.heading / 45) % 8]}`;
     const speed = Math.round(100 * Math.abs(state.speed));
-    speedReadout.textContent = `${speed}%${state.speed < 0 && speed ? " reverse" : ""}`;
+    let pace = "";
+    if (following && speed) {
+      // How much faster than the real sub-satellite point the view moves.
+      const kmPerSecond = Math.abs(state.speed) * flight.cruise / zoom * kmPerDegree;
+      pace = ` · ${numberFormat.format(Math.round(kmPerSecond / orbit(satellite).groundSpeed))}× real`;
+    }
+    speedReadout.textContent = `${speed}%${state.speed < 0 && speed ? " reverse" : ""}${pace}`;
+    if (following) {
+      const day = ascending === (satellite.dayPass === "ascending");
+      const crossing = day ? satellite.crossing : nightCrossing(satellite);
+      passReadout.textContent = `${day ? "Day" : "Night"} · ${ascending ? "ascending" : "descending"} · ${crossing} at equator`;
+    }
     refreshCells();
   }
 
@@ -250,13 +391,17 @@ export function createSatelliteFlight(root, layer, onExit) {
     const dt = previousTime ? Math.min(.05, (time - previousTime) / 1000) : 0;
     previousTime = time;
     const turn = Number(isHeld("right")) - Number(isHeld("left"));
+    // Steering by hand leaves the ground track.
+    if (turn && following) setFollowing(false);
     const thrust = Number(isHeld("forward")) - Number(isHeld("reverse"));
     const zooming = Number(isHeld("zoomIn")) - Number(isHeld("zoomOut"));
     const moving = state.speed || state.slide || state.turnRate;
     const oldBank = bank;
     const oldZoom = zoom;
     if (zooming) targetZoom = clamp(targetZoom * Math.exp(zooming * flight.zoomRate * dt), 1, 9);
+    if (following) holdTrack();
     stepFlight(state, { thrust, turn, boost: isHeld("boost") }, dt, zoom);
+    if (following) holdTrack();
     const targetBank = reducedMotion.matches ? 0 : state.turnRate * .34;
     bank += (targetBank - bank) * (1 - Math.exp(-8 * dt));
     if (Math.abs(targetBank - bank) < .05) bank = targetBank;
@@ -276,6 +421,7 @@ export function createSatelliteFlight(root, layer, onExit) {
     bank = 0;
     zoom = targetZoom = 2.15;
     clearInput();
+    if (following) setFollowing(true);
     invalidate();
   }
 
@@ -290,6 +436,12 @@ export function createSatelliteFlight(root, layer, onExit) {
   }
 
   get("flight-reset").addEventListener("click", reset);
+  swathButton.addEventListener("click", () => {
+    showSwath = !showSwath;
+    swathButton.setAttribute("aria-pressed", String(showSwath));
+    invalidate();
+  });
+  orbitButton.addEventListener("click", () => setFollowing(!following));
   get("flight-exit").addEventListener("click", onExit);
   get("flight-zoom-in").addEventListener("click", () => changeZoom(1.35));
   get("flight-zoom-out").addEventListener("click", () => changeZoom(1 / 1.35));
@@ -388,6 +540,7 @@ export function createSatelliteFlight(root, layer, onExit) {
       selection.textContent = layer.title();
       measure();
       reset();
+      buildPicker();
       canvas.focus({ preventScroll: true });
     },
     stop() {

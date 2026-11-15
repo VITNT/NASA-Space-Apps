@@ -68,6 +68,7 @@ class CalendarTests(unittest.TestCase):
             "date": "2025-02-01", "active_cell_days": 2,
             "modis": 2, "viirs_snpp": 1, "viirs_noaa20": 1, "shared_cell_days": 1,
             "harmonized_cell_days": 1.5,
+            "modis_frp_mw": 10.0, "viirs_snpp_frp_mw": 5.0, "viirs_noaa20_frp_mw": 5.0,
         })
         self.assertEqual(second["active_cell_days"], 1)
 

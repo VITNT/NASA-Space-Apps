@@ -3,14 +3,20 @@ import { enhanceSelect } from "./choice-menu.js";
 import { mapDetail } from "./map-detail.js";
 import { createSatelliteFlight } from "./satellite-flight.js";
 import { seasonalMannKendall } from "./trend.js";
+import { BASELINES, annualTotals, compare, median, rankText, seasonalProfile, unusualMonths } from "./stats.js";
+import { circleArea, decodeArea, encodeArea, outline, polygonArea, shapeParams, shapeText, thin } from "./area.js";
+import { anomalyChart, linesChart, seasonChart, yearChart } from "./charts.js";
 import {
   ACTIVITY, ANOMALY, activityClass, activityColor, activityLabel, anomalyClass, drawLegend,
 } from "./ramp.js";
+import { anomalyDetails, differenceText, inBox, loadAnomalies, regionBox, regionName } from "./anomalies.js";
 
 const $ = (id) => document.getElementById(id);
 const closeMenus = [
   enhanceSelect($("region")),
   enhanceSelect($("dataset")),
+  enhanceSelect($("country"), { searchLabel: "Search countries", searchMode: "search" }),
+  enhanceSelect($("history-baseline")),
   enhanceSelect($("period-month"), { fixedCaption: true, alignEnd: true }),
   enhanceSelect($("period-year"), { fixedCaption: true, alignEnd: true, searchLabel: "Search years" }),
 ];
@@ -76,22 +82,65 @@ const mapCache = new Map();
 let historyRequest;
 let globalHistoryAvailable = false;
 let customBounds = asBounds(regions.cambodia);
+// The other kinds of area: a point and radius, a drawn outline and a country.
+let circle = circleArea(12.5, 105, 50);
+let polygon;
+let country;
+let countryList;
+// The area last applied. It stays in effect while another is being chosen or drawn.
+let appliedArea;
+let stopDraw;
+// Days to select once the month in a shared link has loaded.
+let pendingDays;
+let lastDay;
+let historyBaseline = "median-5";
+let historyView = "calendar";
+// What the loaded History rows cover, so the report can tell when to reload them.
+let historyKey;
+let historyLoad;
+let playToken;
+let mapLoad;
 let view = "explore";
 let selectedPeriod = "2025-02";
 let firstPeriod;
 let lastPeriod;
 let flight;
+// What the map draws: fire detections, or the month's unusual regions.
+let mapMode = "detections";
+let layerKey;
+let anomaliesAvailable = false;
 
 function asBounds([min_lat, max_lat, min_lon, max_lon]) {
   return { min_lat, max_lat, min_lon, max_lon };
 }
 
+// The area the controls describe, or null while one is still being chosen or drawn.
+function chosenArea() {
+  const key = $("region").value;
+  if (key === "circle") {
+    return { ...circle, name: `${circle.km} km around ${coordinate(circle.lat, "S", "N", 2)}, ${coordinate(circle.lon, "W", "E", 2)}` };
+  }
+  if (key === "polygon") return polygon ? { ...polygon, name: "Drawn outline" } : null;
+  if (key === "country") return country ? { ...country, name: country.name } : null;
+  if (key === "custom") return { kind: "box", bounds: customBounds, name: "Custom coordinates" };
+  return { kind: "box", bounds: asBounds(regions[key]), name: $("region").selectedOptions[0].textContent, preset: key };
+}
+
+function area() {
+  return appliedArea ?? chosenArea() ?? { kind: "box", bounds: asBounds(regions.global), name: "Global", preset: "global" };
+}
+
 function bounds() {
-  return $("region").value === "custom" ? customBounds : asBounds(regions[$("region").value]);
+  return area().bounds;
+}
+
+// The area as query parameters: its bounding box, and its shape when it has one.
+function areaQuery() {
+  return { ...bounds(), ...shapeParams(area()) };
 }
 
 function areaName() {
-  return $("region").selectedOptions[0].textContent;
+  return area().name;
 }
 
 function selectedDatasets() {
@@ -146,7 +195,7 @@ function setLayer(layer) {
   const shown = pointHits[pointIndex];
   mapLayer = layer;
   const map = activeGlobe();
-  map.setCells(layer.cells ?? [], true);
+  map.setCells(layer.cells ?? [], layer.dots ?? true);
   map.setPoints?.(layer.points ?? []);
   // Panning reloads the detections. Keep the inspected one marked.
   const same = shown && layer.points?.find((point) => point.latitude === shown.latitude
@@ -163,9 +212,16 @@ function gridLabel(dots, size) {
 }
 
 function showMapKey() {
+  if (mapMode !== "detections") {
+    $("map-key-label").dataset.ramp = "";
+    $("map-key-label").textContent = `1° regions unusual for ${monthFormat.format(dates(selectedPeriod).first)}`;
+    return;
+  }
   $("map-key-label").dataset.ramp = !googleGlobe && !mapLayer.points && mapLayer.cells.length ? "cells" : "";
+  const pixels = !mapLibre || googleGlobe ? ""
+    : mapLibre.showsFootprints() ? " · each shape is one sensor pixel at true size" : " · zoom in to see each sensor pixel";
   $("map-key-label").textContent = googleGlobe ? "Pins · grouped detections"
-    : mapLayer.points ? "Individual detections · brighter = stronger fire"
+    : mapLayer.points ? "Individual detections · brighter = stronger fire" + pixels
     : mapLayer.cells.length ? "Grouped detections · zoom in or pick a day for each hotspot" : "";
 }
 
@@ -174,7 +230,112 @@ function centerMaps() {
   globe.center(area);
   mapLibre?.center(area);
   googleGlobe?.center(area);
+  showAreaOutline();
   scheduleMap();
+}
+
+// Outlines the selected area on the map. The whole world has no outline.
+async function showAreaOutline() {
+  const current = area();
+  let lines = outline(current);
+  if (current.kind === "country") {
+    const { countryLines } = await import("./geography.js");
+    lines = await countryLines(current.name).catch(() => []);
+    if (area().name !== current.name) return;
+  }
+  mapLibre?.setArea(lines);
+}
+
+const drawHints = {
+  box: "Drag a rectangle on the map.",
+  polygon: "Click each corner. Click the first corner again or press Enter to finish.",
+  point: "Click the centre point on the map.",
+};
+
+function endDraw() {
+  stopDraw?.();
+  stopDraw = undefined;
+  $("draw-hint").hidden = true;
+}
+
+// Lets the user mark an area on the map, then hands the result to `done`.
+function startDraw(kind, done) {
+  endDraw();
+  if (!mapLibre || googleGlobe) {
+    $("area-note").textContent = "Drawing needs the dark or NASA satellite map. You can type coordinates instead.";
+    return;
+  }
+  stopPlay();
+  menus[0].open = false;
+  $("draw-hint-text").textContent = drawHints[kind] + " Esc cancels.";
+  $("draw-hint").hidden = false;
+  stopDraw = mapLibre.draw(kind, (result) => {
+    endDraw();
+    done(result);
+  }, endDraw);
+}
+
+function showAreaFields() {
+  const key = $("region").value;
+  $("bounds").hidden = key !== "custom";
+  $("circle").hidden = key !== "circle";
+  $("polygon").hidden = key !== "polygon";
+  $("country-field").hidden = key !== "country";
+  $("polygon-note").textContent = polygon
+    ? `Outline with ${polygon.ring.length} corners. Draw again to replace it.`
+    : "Click each corner on the map. Click the first corner again, or press Enter, to finish.";
+}
+
+// Makes the chosen area the one every view shows.
+function applyArea() {
+  const next = chosenArea();
+  if (!next) return;
+  appliedArea = next;
+  showAreaFields();
+  $("area-note").textContent = "";
+  centerMaps();
+  loadSelection();
+}
+
+function fillForm(form, values) {
+  for (const [name, value] of Object.entries(values)) form.elements[name].value = value;
+}
+
+async function loadCountries() {
+  if (!countryList) {
+    countryList = api("/v1/areas/countries").then(({ data }) => {
+      $("country").replaceChildren(new Option("Choose a country", ""), ...data.map((row) => new Option(row.name)));
+      $("country").options[0].disabled = true;
+      if (country) $("country").value = country.name;
+      return new Map(data.map(({ name, ...box }) => [name, box]));
+    });
+    countryList.catch(() => {
+      countryList = undefined;
+      $("area-note").textContent = "The country list could not be loaded.";
+    });
+  }
+  return countryList;
+}
+
+async function chooseCountry(name) {
+  const box = (await loadCountries())?.get(name);
+  if (!box) return false;
+  country = { kind: "country", name, bounds: box };
+  $("country").value = name;
+  return true;
+}
+
+function drawPolygon() {
+  startDraw("polygon", (ring) => {
+    const lons = ring.map(([, lon]) => lon);
+    if (Math.max(...lons) - Math.min(...lons) > 180) {
+      $("area-note").textContent = "An outline cannot cross the 180° meridian. Use custom coordinates for that area.";
+      return;
+    }
+    polygon = polygonArea(thin(ring));
+    $("region").value = "polygon";
+    $("region").dispatchEvent(new Event("change"));
+  });
 }
 
 function updateMapView() {
@@ -197,6 +358,10 @@ function updateMapView() {
   $("download-visual").disabled = google;
   $("download-visual").title = google ? "Switch to the dark map or NASA satellite to download a map PNG" : "Download map PNG";
   $("download-map").disabled = google;
+  if (google && mapMode !== "detections") setMapMode("detections");
+  $("layer-anomalies").disabled = google || !anomaliesAvailable;
+  $("layer-anomalies").title = google ? "Anomalies are drawn on the dark and NASA satellite maps"
+    : "1° regions far from their usual activity for this calendar month";
   $("export-map-note").textContent = google ? "Switch to the dark map or NASA satellite to save the map."
     : "PNG of the current map view.";
   if (vectorMap) mapLibre.resize();
@@ -229,10 +394,13 @@ async function initMapLibre() {
     mapLibre = await createMapLibreMap($("maplibre"), showCell, (lat, lon) => {
       if (!googleGlobe) showCoordinates(lat, lon);
     }, () => {
-      if (!googleGlobe) scheduleMap();
+      if (googleGlobe) return;
+      showMapKey();
+      scheduleMap();
     }, showPoints);
     mapLibre.setFlat(flatMap);
     mapLibre.center(bounds());
+    showAreaOutline();
     $("style-dark").disabled = false;
     $("style-satellite").disabled = false;
     updateMapView();
@@ -318,6 +486,7 @@ function showDetails(title, values, detection) {
 }
 
 function showCell(cell) {
+  if (cell.kind === "anomaly") return showAnomalyCell(cell);
   showDetails("Grouped detections", [
     ["Average location", `${coordinate(cell.latitude, "S", "N", 3)}, ${coordinate(cell.longitude, "W", "E", 3)}`],
     ["Detections", format(cell.detection_count)],
@@ -326,6 +495,86 @@ function showCell(cell) {
     ["Total FRP", `${format(Math.round(cell.frp_sum_mw))} MW`],
   ]);
   $("inspector").open = true;
+}
+
+// Adds action buttons under the inspector rows.
+function inspectorActions(actions) {
+  for (const [label, run] of actions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "inspector-next";
+    button.textContent = label;
+    button.addEventListener("click", run);
+    $("selection-details").append(button);
+  }
+}
+
+function showAnomalyCell(cell) {
+  const monthName = monthLabel.format(dates(cell.month).first);
+  showDetails("Unusual month", anomalyDetails(cell.anomaly, monthFormat.format(dates(cell.month).first), monthName));
+  inspectorActions([["Show detections here ›", () => {
+    setMapMode("detections");
+    const box = regionBox(cell.anomaly);
+    globe.center(box);
+    mapLibre?.center(box);
+  }]]);
+  $("inspector").open = true;
+}
+
+// Switches what the map draws. Anomalies need the sensor calibration and a
+// map that draws cells (not Google 3D).
+function setMapMode(next) {
+  if (next !== "detections" && (!anomaliesAvailable || googleGlobe)) next = "detections";
+  if (next === mapMode) return;
+  stopPlay();
+  mapMode = next;
+  document.querySelectorAll("#map-layers button").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.layer === next)));
+  $("layer-panel").hidden = next === "detections";
+  resetMap();
+  showMapKey();
+}
+
+function layerSummary(lines) {
+  $("layer-summary").replaceChildren(...lines.map((text) => Object.assign(document.createElement("p"), { textContent: text })));
+}
+
+// Draws the selected month's unusual regions as 1° cells, and says what they are.
+async function loadLayer() {
+  const month = selectedPeriod;
+  const key = `${month}:${encodeArea(area(), area().preset)}`;
+  if (key === layerKey) return;
+  layerKey = key;
+  drawLegend($("layer-legend"), { anomaly: true });
+  $("layer-legend").lastChild?.remove();
+  try {
+    const result = await loadAnomalies(api, month);
+    if (mapMode !== "anomalies" || month !== selectedPeriod) return;
+    setLayer({ cells: result.cells, dots: false });
+    showMapKey();
+    if (!result.available) {
+      layerSummary([result.reason]);
+      $("map-message").textContent = "";
+      return;
+    }
+    const monthName = monthLabel.format(dates(month).first);
+    const above = result.data.filter((item) => item.z > 0).length;
+    const lines = [`${monthFormat.format(dates(month).first)}: ${format(result.data.length)} regions worldwide are unusual for ${monthName}, `
+      + `${format(above)} above and ${format(result.data.length - above)} below their usual activity.`];
+    if (area().preset !== "global") {
+      const local = result.cells.filter((item) => inBox(item, bounds()));
+      lines.push(local.length
+        ? `${areaName()}: ${local.length} unusual ${local.length === 1 ? "region" : "regions"}. Strongest: `
+          + local.slice(0, 3).map(({ anomaly }) => `${regionName(anomaly)}, ${differenceText(anomaly, monthName)}`).join("; ") + "."
+        : `${areaName()}: no unusual regions this month.`);
+    } else {
+      lines.push("Select a region to see how far it is from its usual level.");
+    }
+    layerSummary(lines);
+    $("map-message").textContent = result.cells.length ? "" : "No unusual regions this month";
+  } catch (error) {
+    layerKey = undefined;
+    $("map-message").textContent = error.message;
+  }
 }
 
 function showPoints(hits) {
@@ -418,20 +667,20 @@ function dayStatus(date) {
 
 const names = (platforms) => platforms.map((platform) => platformNames[platform] ?? platform);
 
-function median(values) {
-  const sorted = [...values].sort((a, b) => a - b);
-  return (sorted[Math.floor((sorted.length - 1) / 2)] + sorted[Math.ceil((sorted.length - 1) / 2)]) / 2;
-}
-
-// Up to five earlier years of the same month that can be compared with `period`.
+// The same calendar month in other years that can be compared with `period`.
+// `window` is how many earlier years to look back, Infinity for all of them,
+// or "range" for every other year from `first` to `last`.
 // With harmonization any month some platform observed in full is comparable.
 // Without it, only months observed in full by the very same satellites are.
-function comparablePeriods(period, harmonized) {
+function comparablePeriods(period, harmonized, window = 5, first = 2000, last = Infinity) {
   const active = signatures(period, false);
   if (!active || (!harmonized && active !== signatures(period, true))) return [];
   const year = Number(period.slice(0, 4));
+  const from = window === "range" ? first : Math.max(2000, first, window === Infinity ? 2000 : year - window);
+  const to = window === "range" ? last : year - 1;
   const periods = [];
-  for (let y = Math.max(2000, year - 5); y < year; y++) {
+  for (let y = from; y <= to; y++) {
+    if (y === year) continue;
     const previous = `${y}-${period.slice(5)}`;
     const complete = signatures(previous, true);
     if (harmonized ? complete : complete === active && signatures(previous, false) === active) periods.push(previous);
@@ -439,14 +688,12 @@ function comparablePeriods(period, harmonized) {
   return periods;
 }
 
-// Compares a month with the median of its comparable earlier years. `valueOf`
-// returns a month's value, 0 for observed months without activity, or null
-// when it cannot be used. Needs at least two earlier years.
-function sameMonthComparison(period, value, harmonized, valueOf) {
-  const values = comparablePeriods(period, harmonized).map(valueOf).filter((item) => item != null);
-  if (values.length < 2 || value == null) return null;
-  const middle = median(values);
-  return { median: middle, years: values.length, delta: middle ? (value - middle) / middle : null };
+// Compares a month with a baseline of its comparable years. `valueOf` returns
+// a month's value, 0 for observed months without activity, or null when it
+// cannot be used. Needs at least two baseline years.
+function sameMonthComparison(period, value, harmonized, valueOf, baseline = BASELINES["median-5"], first, last) {
+  const values = comparablePeriods(period, harmonized, baseline.years, first, last).map(valueOf).filter((item) => item != null);
+  return compare(value, values, baseline.stat);
 }
 
 function daySpan(period, from, to) {
@@ -592,6 +839,7 @@ function drawSelection() {
 }
 
 function pickDay(date, extend) {
+  stopPlay();
   if (mode === "week") {
     selected = weekOf(date);
   } else if (mode === "days") {
@@ -616,9 +864,51 @@ function applySelection(focusDate) {
   if (focused) $("days").querySelector(`[data-date="${focusDate}"]`)?.focus();
   drawSelection();
   resetMap();
+  syncLink();
+}
+
+function showPlay() {
+  const playing = Boolean(playToken);
+  $("play").setAttribute("aria-pressed", String(playing));
+  $("play-label").textContent = playing ? "Pause" : "Play";
+  $("explore").classList.toggle("playing", playing);
+}
+
+function stopPlay() {
+  if (!playToken) return;
+  playToken = undefined;
+  showPlay();
+}
+
+// Steps through the month one day at a time. Each day stays on screen for a
+// moment after its detections have loaded, so slow days are not skipped.
+async function play() {
+  if (playToken) return stopPlay();
+  const { days } = dates(selectedPeriod);
+  let day = selected.length === 1 ? Number(selected[0].slice(8)) : 0;
+  if (day >= days) day = 0;
+  if (mode !== "day") setMode("day");
+  const token = {};
+  playToken = token;
+  showPlay();
+  while (playToken === token && day < days) {
+    day += 1;
+    const date = isoDay(selectedPeriod, day);
+    // Days no satellite observed are passed over.
+    if (dayValue(date).count == null) continue;
+    selected = [date];
+    rangeAnchor = date;
+    const shown = performance.now();
+    applySelection();
+    $("days").querySelector(`[data-date="${date}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    await mapLoad;
+    await new Promise((resolve) => setTimeout(resolve, Math.max(250, 900 - (performance.now() - shown))));
+  }
+  if (playToken === token) stopPlay();
 }
 
 function setMode(next) {
+  if (next !== "day") stopPlay();
   mode = next;
   $("days").dataset.mode = next;
   document.querySelectorAll(".calendar-modes button").forEach((button) => button.setAttribute("aria-pressed", button.dataset.mode === next));
@@ -643,13 +933,18 @@ function scheduleMap() {
 function resetMap() {
   clearTimeout(mapTimer);
   mapRequest?.abort();
-  mapCache.clear();
   mapKey = undefined;
-  pointLimit = Infinity;
-  $("map-message").textContent = "Loading map observations…";
-  setLayer({ cells: [] });
-  showMapKey();
-  loadMap();
+  layerKey = undefined;
+  // While playing, the previous day stays on the map until the next has loaded,
+  // and days already shown are kept so replaying them is instant.
+  if (!playToken) {
+    mapCache.clear();
+    pointLimit = Infinity;
+    $("map-message").textContent = "Loading map observations…";
+    setLayer({ cells: [] });
+    showMapKey();
+  }
+  mapLoad = loadMap();
 }
 
 // The request for the mapped activity in view: the selected area, sensor and
@@ -658,7 +953,7 @@ function gridQuery(camera) {
   const { dots, size, viewport } = mapDetail(camera);
   const { start, end } = dates(selectedPeriod);
   const params = new URLSearchParams({
-    ...bounds(), ...sensorParam(), start_date: selected[0] ?? start, end_date: selected.at(-1) ?? end, cell_size: size,
+    ...areaQuery(), ...sensorParam(), start_date: selected[0] ?? start, end_date: selected.at(-1) ?? end, cell_size: size,
   });
   for (const bound of viewport ?? []) params.append("viewport", bound);
   if (selected.length && !isRun()) {
@@ -694,8 +989,25 @@ const flightLayer = {
     const month = `${monthNames[Number(selectedPeriod.slice(5)) - 1]} ${selectedPeriod.slice(0, 4)}`;
     return [areaName(), selectionLabel() ?? month, $("dataset").selectedOptions[0].textContent].join(" · ");
   },
-  query(camera) {
-    const { dots, size, params, key } = gridQuery(camera);
+  // The record's satellites in launch order, each available when it reported
+  // in the selected month, with the span of the archive it covers.
+  satellites() {
+    const datasets = selectedDatasets();
+    const flying = new Set((monthCoverage.get(selectedPeriod) ?? [])
+      .filter((row) => datasets.includes(row.dataset)).map((row) => row.platform));
+    return recordPlatforms().map((key) => {
+      const rows = coverage.filter((row) => row.platform === key && datasets.includes(row.dataset));
+      const archive = rows.length ? {
+        first: rows.map((row) => row.first_date).sort()[0],
+        last: rows.map((row) => row.last_date).sort().at(-1),
+      } : undefined;
+      return { key, available: flying.has(key), archive };
+    });
+  },
+  query(camera, platform) {
+    const { dots, size, params, key: gridKey } = gridQuery(camera);
+    if (platform) params.set("platform", platform);
+    const key = `${gridKey}:${platform ?? ""}`;
     return {
       key,
       async load(signal) {
@@ -720,6 +1032,7 @@ const flightLayer = {
 // marked at the average position of its detections.
 async function loadMap() {
   if (view !== "explore") return;
+  if (mapMode !== "detections") return loadLayer();
   const camera = activeGlobe().getViewport();
   if (!camera) return;
   const grid = gridQuery(camera);
@@ -752,7 +1065,7 @@ async function loadMap() {
     }
     mapCache.delete(key);
     mapCache.set(key, layer);
-    if (mapCache.size > 5) mapCache.delete(mapCache.keys().next().value);
+    if (mapCache.size > (playToken ? 16 : 5)) mapCache.delete(mapCache.keys().next().value);
     setLayer(layer);
     const count = (layer.points ?? layer.cells).length;
     showMapKey();
@@ -765,28 +1078,58 @@ async function loadMap() {
   }
 }
 
-// Earlier months without qualifying activity count as zero, not as missing.
+// Compares the visible month with the same calendar month in up to five
+// earlier years. Earlier months without qualifying activity count as zero.
+//
+// With harmonization the adjusted values are compared. Otherwise the earlier
+// years are counted with only the satellites flying this month, so the
+// comparison is like for like even after a satellite joins or retires. The
+// month still in progress is compared over the same days of the month.
 async function loadAnomaly(period, bbox, rows, signal) {
   const month = Number(period.slice(5));
-  if (!signatures(period, false)) return;
-  const harmonized = harmonizing && rows.every((row) => row.harmonized_cell_days != null);
+  const active = signatures(period, false);
+  if (!active) return;
+  const status = monthStatus(period);
+  const whole = coverageSummary(status) === "full";
+  const harmonized = harmonizing && rows.every((row) => row.harmonized_cell_days != null) && signatures(period, true) !== "";
   const key = harmonized ? "harmonized_cell_days" : "active_cell_days";
-  const prior = comparablePeriods(period, harmonized);
+  // Only the latest month can be "in progress". Other partial months had gaps.
+  const throughDay = !harmonized && !whole && period === lastPeriod && lastDay ? Number(lastDay.slice(8)) : null;
+  if (!harmonized && !whole && !throughDay) return;
+  const platforms = [...status.keys()];
+  const year = Number(period.slice(0, 4));
+  const prior = harmonized ? comparablePeriods(period, true) : [];
+  if (!harmonized) {
+    for (let y = Math.max(2000, year - 5); y < year; y++) {
+      const earlier = monthStatus(`${y}-${period.slice(5)}`);
+      if (platforms.every((platform) => earlier.get(platform)?.state === "full")) prior.push(`${y}-${period.slice(5)}`);
+    }
+  }
+  if (throughDay) $("coverage-note").textContent = `Month in progress: data through ${dayFormat.format(new Date(lastDay))}.`;
   if (prior.length < 2) return;
-  const historic = await api("/v1/calendar", {
+  const params = new URLSearchParams({
     ...bbox, ...sensorParam(), interval: "month", month,
     start_date: dates(prior[0]).start, end_date: dates(prior.at(-1)).end,
-  }, signal);
+  });
+  if (throughDay) params.set("through_day", throughDay);
+  // Name the satellites only when an earlier year had others too.
+  const likeForLike = !harmonized && prior.some((earlier) => signatures(earlier, false) !== active);
+  if (likeForLike) for (const platform of platforms) params.append("platforms", platform);
+  const historic = await api("/v1/calendar", params, signal);
   if (signal.aborted) return;
   const byMonth = new Map(historic.data.map((row) => [row.date.slice(0, 7), row]));
   const value = rows.reduce((sum, row) => sum + row[key], 0);
-  const result = sameMonthComparison(period, value, harmonized,
-    (previous) => byMonth.has(previous) ? byMonth.get(previous)[key] : 0);
+  const result = compare(value, prior.map((earlier) => byMonth.has(earlier) ? byMonth.get(earlier)[key] : 0));
   if (!result || result.delta == null) return;
-  monthComparison = { period, ...result };
+  monthComparison = { period, ...result, throughDay };
+  const monthName = monthNames[month - 1];
   $("anomaly").textContent = percent.format(result.delta);
-  $("anomaly").title = `Median of ${result.years} previous ${monthNames[month - 1]} values: ${format(Math.round(result.median))} cell-days`
-    + (harmonized ? ", adjusted for the satellites flying each year" : "");
+  $("comparison-label").textContent = throughDay ? `vs median of ${monthName} 1–${throughDay} in earlier years` : "vs same-month median";
+  $("anomaly").title = `Median of ${result.years} previous ${monthName} values`
+    + (throughDay ? `, days 1–${throughDay}` : "") + `: ${format(Math.round(result.median))} cell-days`
+    + `. This year is the ${rankText(result)}`
+    + (harmonized ? ", adjusted for the satellites flying each year" : "")
+    + (likeForLike ? `. Earlier years are counted with ${names(platforms).join(", ")} only, the satellites flying this month` : "") + ".";
 }
 
 function sensorParam() {
@@ -800,12 +1143,17 @@ async function loadSelection() {
   const period = selectedPeriod;
   $("previous").disabled = !firstPeriod || period <= firstPeriod;
   $("next").disabled = !lastPeriod || period >= lastPeriod;
-  const bbox = bounds();
+  stopPlay();
+  const bbox = areaQuery();
   const { start, end } = dates(period);
   $("area-name").textContent = areaName();
   $("history-area").textContent = areaName() + " · " + $("dataset").selectedOptions[0].textContent;
-  selected = [];
-  rangeAnchor = null;
+  selected = (pendingDays ?? []).filter((date) => date.startsWith(period) && date <= end);
+  pendingDays = undefined;
+  rangeAnchor = selected[0] ?? null;
+  if (selected.length > 1 && mode === "day") setMode("days");
+  $("play").disabled = !firstPeriod;
+  syncLink();
   calendar = [];
   monthComparison = undefined;
   drawCoverageLabel(period);
@@ -813,9 +1161,11 @@ async function loadSelection() {
   $("activity").textContent = "—";
   $("anomaly").textContent = "—";
   $("anomaly").removeAttribute("title");
+  $("comparison-label").textContent = "vs same-month median";
   $("coverage-note").textContent = "Loading calendar…";
   showDetails("Month overview", []);
   if (view === "history") loadHistory();
+  else historyKey = undefined;
   resetMap();
   try {
     const [response, days] = await Promise.all([
@@ -836,7 +1186,7 @@ async function loadSelection() {
     $("coverage-note").textContent = !active ? "No satellite in this record observed this month."
       : active !== full ? (calendar.some((row) => row.harmonized_cell_days != null)
         ? "The comparison uses only satellites that observed the whole month."
-        : "Not every satellite observed the whole month, so it is left out of median comparisons.")
+        : "Not every satellite observed the whole month, so it has no median comparison.")
       : calendar.length ? "" : "No qualifying detections in this area.";
     await loadAnomaly(period, bbox, calendar, request.signal);
   } catch (error) {
@@ -891,10 +1241,11 @@ function exportName(kind, span) {
 
 // The search every export shares: area, satellite record and bounds.
 function searchColumns() {
-  const area = bounds();
+  const box = bounds();
   return {
     area: areaName(),
-    south: area.min_lat, north: area.max_lat, west: area.min_lon, east: area.max_lon,
+    area_shape: shapeText(area()),
+    south: box.min_lat, north: box.max_lat, west: box.min_lon, east: box.max_lon,
     satellite_record: $("dataset").selectedOptions[0].textContent,
   };
 }
@@ -906,6 +1257,11 @@ function activityColumns(row, covered, adjusted) {
   const columns = { active_cell_days: value(row?.active_cell_days) };
   if (harmonizing) columns.adjusted_cell_days = adjusted ?? "";
   for (const key of selectedDatasets()) columns[`${key}_qualifying_detections`] = value(row?.[key]);
+  // Fire radiative power of those detections. Not comparable between instruments.
+  for (const key of selectedDatasets()) {
+    if (row && row[`${key}_frp_mw`] === undefined) continue;
+    columns[`${key}_frp_mw`] = value(row?.[`${key}_frp_mw`]);
+  }
   if (!$("dataset").value && selectedDatasets().includes("modis") && selectedDatasets().length > 1) {
     columns.modis_viirs_shared_cell_days = value(row?.shared_cell_days);
   }
@@ -928,6 +1284,7 @@ function calendarRows() {
       ...activityColumns(row, covered, row?.harmonized_cell_days),
       activity_class: activityLabel(activityClass(count, peak)),
       month_vs_same_month_median: monthComparison ? percent.format(monthComparison.delta) : "",
+      comparison_days: monthComparison?.throughDay ? `1-${monthComparison.throughDay}` : monthComparison ? "whole month" : "",
       coverage: !covered ? "none" : cover.missing.length ? "partial" : "full",
       satellites_reporting: names(cover.reporting).join("; "),
       satellites_missing: names(cover.missing).join("; "),
@@ -941,7 +1298,8 @@ function calendarRows() {
 function historyCsvRows() {
   const from = $("history-start").value;
   const to = $("history-end").value;
-  const { values, peak, comparison } = historyModel(historyRows, from, to);
+  const model = historyModel(historyRows, from, to);
+  const { values, peak, comparison } = model;
   const search = searchColumns();
   const rows = [];
   for (let period = from; period <= to; period = nextPeriod(period)) {
@@ -954,9 +1312,17 @@ function historyCsvRows() {
       ...search,
       ...activityColumns(entry?.row, status.size > 0, entry?.row?.harmonized_cell_days),
       activity_class: activityLabel(activityClass(entry?.value, peak)),
-      same_month_median: result ? Math.round(result.median) : "",
-      vs_same_month_median: result?.delta == null ? "" : percent.format(result.delta),
-      median_years: result?.years ?? "",
+      baseline: BASELINES[historyBaseline].label,
+      baseline_value: result ? Math.round(result.centre) : "",
+      vs_baseline: result?.delta == null ? "" : percent.format(result.delta),
+      baseline_years: result?.years ?? "",
+      z_score: result?.z == null ? "" : result.z.toFixed(2),
+      rank_among_same_months: result ? `${result.rank} of ${result.of}` : "",
+      percentile: result ? Math.round(result.percentile * 100) : "",
+      ...(harmonizing ? {
+        unusual: model.unusual.has(period) ? (model.unusual.get(period).z > 0 ? "above" : "below") : "",
+        unusual_robust_z: model.unusual.get(period)?.z.toFixed(2) ?? "",
+      } : {}),
       coverage: coverageSummary(status),
       satellites_full_month: names(platforms.filter(([, item]) => item.state === "full").map(([key]) => key)).join("; "),
       satellites_part_month: platforms.filter(([, item]) => item.state === "partial")
@@ -976,7 +1342,7 @@ function nextPeriod(period) {
 function exportParams() {
   const { start, end } = dates(selectedPeriod);
   const params = new URLSearchParams({
-    ...bounds(), ...sensorParam(), start_date: selected[0] ?? start, end_date: selected.at(-1) ?? end,
+    ...areaQuery(), ...sensorParam(), start_date: selected[0] ?? start, end_date: selected.at(-1) ?? end,
   });
   if (selected.length && !isRun()) for (const day of selected) params.append("days", day);
   return params;
@@ -1033,7 +1399,30 @@ function download(filename, blob) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-async function loadHistory() {
+// What a History load depends on: the area, the record and the range.
+function historyState() {
+  return [encodeArea(area(), area().preset), $("dataset").value, $("history-start").value, $("history-end").value].join("|");
+}
+
+// Loads History unless the rows on hand already cover the current search.
+// Resolves to true when they do.
+function ensureHistory() {
+  if (historyKey === historyState() && historyLoad) return historyLoad;
+  return loadHistory();
+}
+
+function loadHistory() {
+  const key = historyState();
+  historyKey = key;
+  historyLoad = fetchHistory().then((done) => {
+    if (!done && historyKey === key) historyKey = undefined;
+    return done;
+  });
+  return historyLoad;
+}
+
+async function fetchHistory() {
+  syncLink();
   historyRequest?.abort();
   const request = new AbortController();
   historyRequest = request;
@@ -1042,14 +1431,17 @@ async function loadHistory() {
   const table = $("history-table");
   const note = $("history-note");
   table.replaceChildren();
+  $("history-graphs").replaceChildren();
   $("history-trend").hidden = true;
-  $("download-history").disabled = true;
+  $("history-unusual").hidden = true;
+  $("history-export-note").hidden = true;
+  for (const id of ["download-history", "download-history-points", "history-report"]) $(id).disabled = true;
   historyRows = [];
   if (!from || !to || from > to) {
     note.textContent = "Choose a valid month range.";
-    return;
+    return false;
   }
-  const bbox = bounds();
+  const bbox = areaQuery();
   const params = sensorParam();
   note.textContent = "Loading monthly activity…";
   try {
@@ -1075,23 +1467,25 @@ async function loadHistory() {
           end_date: year === lastYear ? dates(to).end : `${year}-12-31`,
           interval: "month",
         }, request.signal);
-        if (request.signal.aborted) return;
+        if (request.signal.aborted) return false;
         rows.push(...result.data);
         if (year !== firstYear) renderHistory(table, rows, from, to, year, lastYear);
       }
     }
-    if (request.signal.aborted) return;
+    if (request.signal.aborted) return false;
     historyRows = rows.sort((a, b) => a.date.localeCompare(b.date));
     const observed = historyModel(rows, from, to).values.size;
-    $("download-history").disabled = !observed;
+    for (const id of ["download-history", "download-history-points", "history-report"]) $(id).disabled = !observed;
     note.textContent = !observed ? "No satellite in this record observed this range."
       : "Select a month to open it in Explore. Hatched months had no satellite coverage. " + (harmonizing
         ? "Adjusted estimates are shown where available. Hover for coverage and observed counts."
         : "Ticks under each value show which satellites observed that month.");
     renderHistory(table, rows, from, to, firstYear, lastYear);
     drawTrend(rows, from, to);
+    return true;
   } catch (error) {
     if (!request.signal.aborted) note.textContent = `History could not finish loading. ${error.message} Try applying the range again.`;
+    return false;
   }
 }
 
@@ -1112,19 +1506,115 @@ function historyModel(rows, from, to) {
     });
   }
   const peak = Math.max(1, ...[...values.values()].map((entry) => entry.value));
-  // Baselines can only use earlier years inside the loaded range.
+  // Baselines can only use years inside the loaded range.
+  const baseline = BASELINES[historyBaseline];
   const comparison = (period) => {
     const entry = values.get(period);
     if (!entry) return null;
     const key = entry.harmonized ? "harmonized_cell_days" : "active_cell_days";
     return sameMonthComparison(period, entry.harmonized ? entry.row?.harmonized_cell_days ?? 0 : entry.observed, entry.harmonized,
       (previous) => {
-        if (previous < from) return null;
+        if (previous < from || previous > to) return null;
         const row = byMonth.get(previous);
         return row ? row[key] : 0;
-      });
+      }, baseline, Number(from.slice(0, 4)), Number(to.slice(0, 4)));
   };
-  return { values, peak, comparison };
+  // Year totals, each complete year ranked and set against the median year,
+  // and the seasonal cycle: the spread of every calendar month over the years.
+  const amounts = new Map([...values].map(([period, entry]) => [period, entry.value]));
+  const annual = annualTotals(amounts);
+  const completeTotals = annual.filter((item) => item.complete).map((item) => item.total);
+  const typicalYear = completeTotals.length ? median(completeTotals) : null;
+  for (const item of annual) {
+    if (!item.complete) continue;
+    // Without harmonization a year is only compared with years seen by the same satellites.
+    const others = annual.filter((other) => other.complete && other !== item
+      && (harmonizing || yearSignature(other.year) === yearSignature(item.year))).map((other) => other.total);
+    const result = compare(item.total, others, baseline.stat);
+    item.result = result;
+    item.rank = result ? rankText(result, "complete years") : "";
+    item.delta = typicalYear ? (item.total - typicalYear) / typicalYear : null;
+  }
+  // Months far from the same calendar month in the other years, on adjusted
+  // values only: raw counts would flag every year a satellite joined.
+  // A month needs two satellites that observed all of it, unless the record has
+  // one satellite and needs no adjustment: Terra alone was never validated.
+  const platforms = recordPlatforms().length;
+  const reliable = (period) => {
+    const full = signatures(period, true).split(",").filter(Boolean).length;
+    return full >= 2 || (platforms === 1 && full === 1);
+  };
+  const unusual = harmonizing
+    ? unusualMonths(new Map([...values].filter(([period, entry]) => entry.harmonized && reliable(period))
+      .map(([period, entry]) => [period, entry.value])))
+    : [];
+  return {
+    values, peak, comparison, annual, typicalYear, profile: seasonalProfile(amounts), byMonth,
+    unusual: new Map(unusual.map((item) => [item.period, item])),
+  };
+}
+
+function unusualText(item) {
+  return `${item.delta == null ? "activity where the month usually has none" : `${percent.format(item.delta)} vs the median of ${item.years} other years`}`
+    + `, robust z ${item.z > 0 ? "+" : ""}${item.z.toFixed(1)}`;
+}
+
+// Lists the range's unusual months; each opens in Explore.
+function drawUnusual(model) {
+  const output = $("history-unusual");
+  const items = [...model.unusual.values()].sort((a, b) => a.period.localeCompare(b.period));
+  output.hidden = !harmonizing || !model.values.size;
+  if (output.hidden) return;
+  if (!items.length) {
+    output.replaceChildren("No unusual months: every month is within the usual range for its calendar month (robust z under 3).");
+    return;
+  }
+  const label = (period) => `${monthNames[Number(period.slice(5)) - 1]} ${period.slice(0, 4)}`;
+  const shown = [...items].sort((a, b) => Math.abs(b.z) - Math.abs(a.z)).slice(0, 10).sort((a, b) => a.period.localeCompare(b.period));
+  const parts = [`${items.length} unusual ${items.length === 1 ? "month" : "months"} against the same month in other years: `];
+  shown.forEach((item, index) => {
+    if (index) parts.push(Object.assign(document.createElement("span"), { className: "separator", textContent: " · " }));
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "link-button";
+    button.textContent = `${label(item.period)} ${item.z > 0 ? "▲" : "▼"} ${item.delta == null ? "new" : percent.format(item.delta)}`;
+    button.title = `${label(item.period)}: ${unusualText(item)}. Open in Explore.`;
+    button.addEventListener("click", () => {
+      if (!selectPeriod(item.period)) return;
+      setView("explore");
+      loadSelection();
+    });
+    parts.push(button);
+  });
+  if (items.length > shown.length) parts.push(` and ${items.length - shown.length} more, ringed in the calendar.`);
+  output.replaceChildren(...parts);
+}
+
+// The satellites that observed each month of a year in full.
+function yearSignature(year) {
+  return monthNames.map((_, index) => signatures(`${year}-${String(index + 1).padStart(2, "0")}`, true)).join("|");
+}
+
+// How a month's comparison reads in tooltips and for screen readers.
+function comparisonText(result) {
+  if (result?.delta == null) return "no baseline for this month";
+  return `${percent.format(result.delta)} vs ${BASELINES[historyBaseline].stat} of ${result.years} `
+    + `${BASELINES[historyBaseline].years === "range" ? "other" : "earlier"} years (${format(Math.round(result.centre))})`
+    + `; ${rankText(result, "years")}` + (result.z == null ? "" : `; z = ${result.z.toFixed(1)}`);
+}
+
+// A shaded, non-interactive cell for year totals and the typical month.
+function summaryCell(text, step, ramp, title) {
+  const cell = document.createElement("div");
+  cell.className = "history-cell history-summary";
+  cell.dataset.level = step ?? "plain";
+  if (step) {
+    cell.style.setProperty("--fill", ramp[step - 1].color);
+    cell.dataset.ink = ramp[step - 1].ink;
+  }
+  cell.textContent = text;
+  cell.title = title;
+  return cell;
 }
 
 function renderHistory(table, rows, from, to, firstYear, lastYear) {
@@ -1132,9 +1622,14 @@ function renderHistory(table, rows, from, to, firstYear, lastYear) {
   table.replaceChildren();
   // While years are still loading, only the loaded ones count toward the peak and baselines.
   const loaded = `${firstYear}-01` > from ? `${firstYear}-01` : from;
-  const { values, peak, comparison } = historyModel(rows, loaded, to);
+  const model = historyModel(rows, loaded, to);
+  const { values, peak, comparison, annual, typicalYear, profile } = model;
   const anomaly = historyShade === "anomaly";
   const platforms = recordPlatforms();
+  const annualPeak = Math.max(1, ...annual.map((item) => item.total));
+  const unit = harmonizing ? "adjusted cell-days" : "active cell-days";
+  renderGraphs(model, loaded, to);
+  drawUnusual(model);
   drawLegend($("history-legend"), { peak, anomaly });
   $("history-ticks").replaceChildren(...platforms.map((platform) => {
     const item = document.createElement("span");
@@ -1142,7 +1637,7 @@ function renderHistory(table, rows, from, to, firstYear, lastYear) {
     return item;
   }));
   const header = table.createTHead().insertRow();
-  for (const name of ["Year", ...monthNames]) {
+  for (const name of ["Year", ...monthNames, "Year total"]) {
     const cell = document.createElement("th");
     cell.scope = "col";
     cell.textContent = name;
@@ -1173,6 +1668,8 @@ function renderHistory(table, rows, from, to, firstYear, lastYear) {
         button.style.setProperty("--fill", ramp[step - 1].color);
         button.dataset.ink = ramp[step - 1].ink;
       }
+      const unusual = model.unusual.get(period);
+      if (unusual) button.dataset.unusual = unusual.z > 0 ? "high" : "low";
       const value = document.createElement("span");
       value.textContent = count == null ? "—"
         : anomaly ? (result?.delta == null ? "n/a" : percent.format(result.delta)) : format(count);
@@ -1189,13 +1686,12 @@ function renderHistory(table, rows, from, to, firstYear, lastYear) {
       button.append(value, ticks);
       const coverageText = !status.size ? "no satellite coverage" : [...status.entries()].map(([platform, item]) =>
         `${platformNames[platform]} ${item.state === "full" ? "all month" : `${item.days} of ${item.total} days`}`).join(", ");
-      const comparisonText = result?.delta == null ? "no same-month baseline"
-        : `${percent.format(result.delta)} vs median of ${result.years} earlier years (${format(Math.round(result.median))})`;
       const adjusted = entry && entry.value !== entry.observed;
       button.setAttribute("aria-label", [
         `${name} ${year}`,
         count == null ? null : `${format(count)} active cell-days, ${activityLabel(activityClass(count, peak))}`,
-        count == null ? null : comparisonText,
+        count == null ? null : comparisonText(result),
+        unusual ? `unusual: ${unusualText(unusual)}` : null,
         adjusted ? `observed ${format(entry.observed)}` : null,
         `coverage: ${coverageText}`,
       ].filter(Boolean).join("; "));
@@ -1207,15 +1703,127 @@ function renderHistory(table, rows, from, to, firstYear, lastYear) {
       });
       cell.append(button);
     });
+    // The year as a whole. A year missing months is shown faint and not ranked.
+    const year_ = annual.find((item) => item.year === year);
+    const totalCell = row.insertCell();
+    if (year_) {
+      const months = `${year_.months} of 12 months`;
+      totalCell.append(!year_.complete
+        ? summaryCell(format(Math.round(year_.total)), null, ACTIVITY, `${year}: ${format(Math.round(year_.total))} ${unit} in ${months}. Not ranked.`)
+        : anomaly
+          ? summaryCell(year_.result?.delta == null ? "n/a" : percent.format(year_.result.delta), anomalyClass(year_.result?.delta), ANOMALY,
+            `${year}: ${format(Math.round(year_.total))} ${unit}, ${comparisonTextYear(year_)}`)
+          : summaryCell(format(Math.round(year_.total)), activityClass(year_.total, annualPeak), ACTIVITY,
+            `${year}: ${format(Math.round(year_.total))} ${unit}, ${comparisonTextYear(year_)}`));
+      if (!year_.complete) totalCell.firstChild.dataset.partial = "";
+    }
+  }
+  // The seasonal cycle: the median of each calendar month over the years shown.
+  if (profile.some(Boolean)) {
+    const row = table.createTFoot().insertRow();
+    const label = document.createElement("th");
+    label.scope = "row";
+    label.textContent = "Median";
+    label.title = "The median of each calendar month over the years shown: the seasonal cycle";
+    row.append(label);
+    profile.forEach((item, index) => {
+      const cell = row.insertCell();
+      if (!item) return;
+      cell.append(summaryCell(format(Math.round(item.median)), anomaly ? null : activityClass(item.median, peak), ACTIVITY,
+        `${monthNames[index]}: median ${format(Math.round(item.median))} ${unit} over ${item.years} years; `
+        + `middle 80% of years ${format(Math.round(item.low))}–${format(Math.round(item.high))}; highest ${format(Math.round(item.max))}`));
+    });
+    const cell = row.insertCell();
+    if (typicalYear != null) {
+      cell.append(summaryCell(format(Math.round(typicalYear)), anomaly ? null : activityClass(typicalYear, annualPeak), ACTIVITY,
+        `Median complete year: ${format(Math.round(typicalYear))} ${unit}`));
+    }
   }
   if (focused) table.querySelector(`[data-period="${focused}"]`)?.focus({ preventScroll: true });
 }
 
+function comparisonTextYear(item) {
+  const result = item.result;
+  if (!result) return harmonizing ? "too few complete years to compare" : "too few complete years with the same satellites to compare";
+  return `${item.rank}` + (result.delta == null ? "" : `, ${percent.format(result.delta)} vs ${BASELINES[historyBaseline].stat} of the other complete years`)
+    + (result.z == null ? "" : `, z = ${result.z.toFixed(1)}`);
+}
+
+// Annual fire radiative power per satellite record, or null when the rows
+// carry none (the precomputed global history does not).
+function frpSeries(rows, firstYear, lastYear) {
+  if (!rows.some((row) => row.modis_frp_mw !== undefined)) return null;
+  const years = Array.from({ length: lastYear - firstYear + 1 }, (_, index) => firstYear + index);
+  const series = selectedDatasets().map((key) => {
+    const flown = new Set(coverage.filter((row) => row.dataset === key)
+      .flatMap((row) => years.filter((year) => String(year) >= row.first_date.slice(0, 4) && String(year) <= row.last_date.slice(0, 4))));
+    const totals = new Map();
+    for (const row of rows) {
+      const year = Number(row.date.slice(0, 4));
+      totals.set(year, (totals.get(year) ?? 0) + (row[`${key}_frp_mw`] ?? 0));
+    }
+    return { key, label: datasets[key], values: years.map((year) => flown.has(year) ? (totals.get(year) ?? 0) / 1000 : null) };
+  });
+  return { years, series };
+}
+
+// The charts History shows, as figures. `options` passes the theme and
+// whether they respond to the pointer (not in the report).
+function historyFigures(model, from, to, options = {}) {
+  const { values, comparison, annual, typicalYear, profile, byMonth } = model;
+  const unit = harmonizing ? "Adjusted cell-days" : "Active cell-days";
+  const figures = [];
+  if (!values.size) return figures;
+  figures.push(yearChart({ years: annual, median: typicalYear, unit: unit.toLowerCase(), ...options }));
+  // The year on show in Explore when it is in range, else the latest one.
+  const years = annual.map((item) => item.year);
+  const focusYear = years.includes(Number(selectedPeriod.slice(0, 4))) ? Number(selectedPeriod.slice(0, 4)) : years.at(-1);
+  figures.push(seasonChart({
+    profile, monthNames, unit: unit.toLowerCase(), ...options,
+    focus: { label: String(focusYear), values: monthNames.map((_, index) => values.get(`${focusYear}-${String(index + 1).padStart(2, "0")}`)?.value ?? null) },
+  }));
+  const months = [];
+  for (let period = from; period <= to; period = nextPeriod(period)) {
+    const result = comparison(period);
+    months.push({
+      period, label: `${monthNames[Number(period.slice(5)) - 1]} ${period.slice(0, 4)}`,
+      delta: result?.delta ?? null, value: values.get(period)?.value, centre: result?.centre,
+    });
+  }
+  if (months.some((month) => month.delta != null)) {
+    figures.push(anomalyChart({ months, baseline: BASELINES[historyBaseline].short, ...options }));
+  }
+  const frp = frpSeries([...byMonth.values()].filter((row) => row.date.slice(0, 7) >= from && row.date.slice(0, 7) <= to),
+    Number(from.slice(0, 4)), Number(to.slice(0, 4)));
+  if (frp) {
+    figures.push(linesChart({
+      ...frp, unit: "GW", title: "Fire radiative power by satellite record", ...options,
+      note: "Yearly total, in gigawatts, of the detections the calendar counts. Instruments measure it differently, so follow one line at a time.",
+    }));
+  }
+  return figures;
+}
+
+function renderGraphs(model, from, to) {
+  const figures = historyFigures(model, from, to);
+  if (!figures.length) {
+    $("history-graphs").replaceChildren();
+    return;
+  }
+  const footnote = document.createElement("p");
+  footnote.className = "muted chart-footnote";
+  footnote.textContent = (harmonizing
+    ? "Counts are adjusted to what the full set of satellites would have seen."
+    : "Counts are as observed. Years with different satellites are not directly comparable until the sensor calibration has been run.")
+    + (model.byMonth.size && [...model.byMonth.values()].every((row) => row.modis_frp_mw === undefined)
+      ? " Fire radiative power is charted for regional areas, not the precomputed global history." : "");
+  $("history-graphs").replaceChildren(...figures, footnote);
+}
+
 // Tests the adjusted monthly series for a monotonic trend. Months that no
 // platform observed in full are left out; observed months without fire count as zero.
-function drawTrend(rows, from, to) {
-  const output = $("history-trend");
-  if (!harmonizing) return;
+function trendResult(rows, from, to) {
+  if (!harmonizing) return null;
   const values = new Map(rows.map((row) => [row.date.slice(0, 7), row.harmonized_cell_days]));
   const points = [];
   for (let year = Number(from.slice(0, 4)); year <= Number(to.slice(0, 4)); year++) {
@@ -1228,31 +1836,194 @@ function drawTrend(rows, from, to) {
   }
   const years = new Set(points.map((point) => point.year)).size;
   const result = years >= 5 ? seasonalMannKendall(points) : null;
-  output.hidden = false;
-  if (!result) {
-    output.textContent = "Trend test: choose a range of at least five years with fire activity.";
-    return;
-  }
+  if (!result) return { headline: "Trend test: choose a range of at least five years with fire activity.", detail: "" };
   const mean = points.reduce((sum, point) => sum + point.value, 0) / points.length;
   const rate = new Intl.NumberFormat("en", { style: "percent", signDisplay: "exceptZero", maximumFractionDigits: 1 }).format(result.slope / mean);
   const p = result.p < .001 ? "p < 0.001" : "p = " + result.p.toFixed(3);
   const significant = result.p < .05;
-  const headline = significant
-    ? `${result.s > 0 ? "Increasing" : "Decreasing"} trend, ${rate} per year`
-    : "No significant trend";
+  return {
+    headline: significant ? `${result.s > 0 ? "Increasing" : "Decreasing"} trend, ${rate} per year` : "No significant trend",
+    detail: `Seasonal Mann-Kendall test on ${points.length} adjusted months, ${points[0].year}–${points.at(-1).year}: `
+      + `τ = ${result.tau.toFixed(2)}, Z = ${result.z.toFixed(2)}, ${p}`
+      + (significant ? "" : `, Sen slope ${rate} per year`)
+      + ". Trends that cross 2012 or 2018 rely on the satellite adjustment.",
+  };
+}
+
+function drawTrend(rows, from, to) {
+  const output = $("history-trend");
+  const result = trendResult(rows, from, to);
+  if (!result) return;
+  output.hidden = false;
   const detail = document.createElement("small");
-  detail.textContent = `Seasonal Mann-Kendall test on ${points.length} adjusted months, ${points[0].year}–${points.at(-1).year}: `
-    + `τ = ${result.tau.toFixed(2)}, Z = ${result.z.toFixed(2)}, ${p}`
-    + (significant ? "" : `, Sen slope ${rate} per year`)
-    + ". Trends that cross 2012 or 2018 rely on the satellite adjustment.";
-  output.replaceChildren(headline, detail);
+  detail.textContent = result.detail;
+  output.replaceChildren(result.headline, ...(result.detail ? [detail] : []));
+}
+
+function rerenderHistory() {
+  const from = $("history-start").value;
+  const to = $("history-end").value;
+  if (from && to && from <= to && (historyRows.length || from)) {
+    renderHistory($("history-table"), historyRows, from, to, Number(from.slice(0, 4)), Number(to.slice(0, 4)));
+  }
+}
+
+function setHistoryView(next) {
+  historyView = next;
+  document.querySelectorAll(".history-view button").forEach((button) => button.setAttribute("aria-pressed", button.dataset.historyView === next));
+  $("history-calendar").hidden = next !== "calendar";
+  $("history-graphs").hidden = next !== "graphs";
+  $("history").dataset.view = next;
+  syncLink();
+}
+
+// Every detection in the History range, when there are few enough to export whole.
+async function downloadHistoryPoints() {
+  const note = $("history-export-note");
+  const from = $("history-start").value;
+  const to = $("history-end").value;
+  const params = new URLSearchParams({ ...areaQuery(), ...sensorParam(), start_date: dates(from).start, end_date: dates(to).end });
+  note.hidden = false;
+  note.textContent = "Counting detections in this range…";
+  try {
+    const result = await api("/v1/export/hotspots/count", params);
+    if (!result.count) {
+      note.textContent = "No detections in this area and range.";
+    } else if (result.count > result.limit) {
+      note.textContent = `${format(result.count)} detections in this range. One file holds up to ${format(result.limit)}, so narrow the range or the area. `
+        + "History CSV has every month's totals, and Explore exports any single month.";
+    } else {
+      const link = document.createElement("a");
+      link.href = "/v1/export/hotspots.csv?" + params;
+      link.download = exportName("hotspots", `${from}_to_${to}`) + ".csv";
+      link.click();
+      note.textContent = `Downloading ${format(result.count)} detections, ${format(result.qualifying)} of them counted in the calendar.`;
+    }
+  } catch (error) {
+    note.textContent = error.message;
+  }
+}
+
+// The current area, record, date and view as a link.
+function linkState() {
+  const params = new URLSearchParams({ area: encodeArea(area(), area().preset), month: selectedPeriod });
+  if (selected.length) params.set("days", selected.map((date) => Number(date.slice(8))).join("."));
+  if ($("dataset").value) params.set("record", $("dataset").value);
+  if (view !== "explore") params.set("view", view);
+  if (view === "history") {
+    params.set("from", $("history-start").value);
+    params.set("to", $("history-end").value);
+    if (historyView !== "calendar") params.set("show", historyView);
+    if (historyShade !== "activity") params.set("shade", historyShade);
+    if (historyBaseline !== "median-5") params.set("baseline", historyBaseline);
+  }
+  // Keep the punctuation of areas and day lists readable in the address bar.
+  return "#" + params.toString().replace(/%3A/g, ":").replace(/%2C/g, ",");
+}
+
+function syncLink() {
+  if (!firstPeriod) return;
+  history.replaceState(null, "", linkState());
+}
+
+// Applies a shared link to the controls before the first load.
+async function restoreLink() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const record = params.get("record");
+  if (record && [...$("dataset").options].some((option) => option.value === record)) $("dataset").value = record;
+  const target = decodeArea(params.get("area"), regions);
+  if (target?.preset) $("region").value = target.preset;
+  else if (target?.country) {
+    if (await chooseCountry(target.country).catch(() => false)) $("region").value = "country";
+  } else if (target?.kind === "box") {
+    customBounds = target.bounds;
+    fillForm($("bounds"), customBounds);
+    $("region").value = "custom";
+  } else if (target?.kind === "circle") {
+    circle = target;
+    fillForm($("circle"), { lat: circle.lat, lon: circle.lon, km: circle.km });
+    $("region").value = "circle";
+  } else if (target?.kind === "polygon") {
+    polygon = target;
+    $("region").value = "polygon";
+  }
+  showAreaFields();
+  const month = params.get("month");
+  if (/^\d{4}-\d{2}$/.test(month ?? "")) selectPeriod(month);
+  const days = (params.get("days") ?? "").split(".").map(Number).filter((day) => day >= 1 && day <= 31);
+  if (days.length) pendingDays = [...new Set(days)].sort((a, b) => a - b).map((day) => isoDay(selectedPeriod, day));
+  for (const [name, id] of [["from", "history-start"], ["to", "history-end"]]) {
+    const value = params.get(name);
+    if (/^\d{4}-\d{2}$/.test(value ?? "") && value >= firstPeriod && value <= lastPeriod) $(id).value = value;
+  }
+  if (Object.hasOwn(BASELINES, params.get("baseline") ?? "")) {
+    historyBaseline = params.get("baseline");
+    $("history-baseline").value = historyBaseline;
+  }
+  if (params.get("shade") === "anomaly") {
+    historyShade = "anomaly";
+    document.querySelectorAll(".history-shade button").forEach((item) => item.setAttribute("aria-pressed", item.dataset.shade === "anomaly"));
+  }
+  if (params.get("show") === "graphs") historyView = "graphs";
+  for (const id of ["region", "dataset", "country", "history-baseline"]) $(id).dispatchEvent(new Event("refresh"));
+  return ["history", "flight"].includes(params.get("view")) ? params.get("view") : "explore";
+}
+
+// A printable page about the area: its fire history, charts, trend and method.
+async function downloadReport(note) {
+  const say = (text) => { note.textContent = text; };
+  say("Loading the area's history…");
+  try {
+    if (!await ensureHistory()) throw new Error("The history for this area could not be loaded.");
+    const from = $("history-start").value;
+    const to = $("history-end").value;
+    const model = historyModel(historyRows, from, to);
+    if (!model.values.size) throw new Error("No satellite observed this range.");
+    say("Building the report…");
+    const { buildReport } = await import("./report.js");
+    const mapImage = await new Promise((resolve) => {
+      const map = activeGlobe();
+      if (!map.exportImage || googleGlobe || view !== "explore") return resolve(null);
+      map.exportImage((blob) => {
+        if (!blob) return resolve(null);
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(blob);
+      });
+    });
+    const { THEMES } = await import("./charts.js");
+    const html = buildReport({
+      area: areaName(), shape: shapeText(area()), bounds: bounds(),
+      record: $("dataset").selectedOptions[0].textContent,
+      from, to, lastDay, harmonizing, model, monthNames,
+      baseline: BASELINES[historyBaseline],
+      trend: trendResult(historyRows, from, to),
+      month: {
+        label: monthFormat.format(dates(selectedPeriod).first),
+        total: calendar.reduce((sum, row) => sum + row.active_cell_days, 0),
+        comparison: monthComparison?.period === selectedPeriod ? monthComparison : null,
+        mapCaption: exportScope(),
+      },
+      mapImage,
+      figures: historyFigures(model, from, to, { theme: THEMES.light, interactive: false }),
+      link: location.origin + location.pathname + linkState(),
+    });
+    download(exportName("report", `${from}_to_${to}`) + ".html", new Blob([html], { type: "text/html;charset=utf-8" }));
+    say("Report downloaded. Open it in a browser, then print it to save a PDF.");
+  } catch (error) {
+    say(error.message);
+  }
 }
 
 function setView(next) {
   const leavingFlight = view === "flight" && next !== "flight";
   const returnFocus = leavingFlight && $("flight").contains(document.activeElement);
   if (leavingFlight) flight.stop();
-  if (view === "history" && next !== "history") historyRequest?.abort();
+  if (next !== "explore") {
+    stopPlay();
+    endDraw();
+  }
   if (view === "explore" && next !== "explore") {
     clearTimeout(mapTimer);
     mapRequest?.abort();
@@ -1265,7 +2036,8 @@ function setView(next) {
   $("flight").hidden = next !== "flight";
   document.querySelectorAll(".topbar [data-view]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.view === next));
   $("export-menu").open = false;
-  if (next === "history" && firstPeriod) loadHistory();
+  syncLink();
+  if (next === "history" && firstPeriod) ensureHistory();
   else if (next === "flight") {
     if (!flight) {
       flight = createSatelliteFlight($("flight"), flightLayer, () => setView("explore"));
@@ -1295,6 +2067,8 @@ async function init() {
     areaLabel = health.area_label;
     harmonizing = health.calibration_available;
     globalHistoryAvailable = health.global_history_available;
+    anomaliesAvailable = Boolean(health.anomalies_available);
+    $("layer-anomalies").disabled = !anomaliesAvailable || Boolean(googleGlobe);
     status(areaLabel ? areaLabel + " archive" : "Global FIRMS archive", "ready");
     for (const [key, name] of Object.entries(datasets)) {
       if (coverage.some((row) => row.dataset === key)) $("dataset").add(new Option(name, key));
@@ -1303,6 +2077,7 @@ async function init() {
     const latestDay = coverage.map((row) => row.last_date).sort().at(-1);
     const first = firstDay.slice(0, 7);
     const latest = latestDay.slice(0, 7);
+    lastDay = latestDay;
     for (const id of ["history-start", "history-end"]) {
       $(id).min = first;
       $(id).max = latest;
@@ -1323,8 +2098,12 @@ async function init() {
     $("period-year").disabled = false;
     $("history-start").value = first;
     $("history-end").value = latest;
+    const startView = await restoreLink();
+    appliedArea = chosenArea() ?? undefined;
+    setHistoryView(historyView);
     centerMaps();
     loadSelection();
+    if (startView !== "explore") setView(startView);
   } catch (error) {
     status("Archive unavailable", "error");
     $("coverage-note").textContent = error.message;
@@ -1333,10 +2112,35 @@ async function init() {
 }
 
 $("region").addEventListener("change", () => {
-  $("bounds").hidden = $("region").value !== "custom";
-  centerMaps();
-  loadSelection();
+  endDraw();
+  showAreaFields();
+  $("area-note").textContent = "";
+  const key = $("region").value;
+  if (key === "polygon" && !polygon) drawPolygon();
+  else if (key === "country" && !country) loadCountries();
+  else applyArea();
 });
+$("country").addEventListener("change", async () => {
+  if (await chooseCountry($("country").value)) applyArea();
+});
+$("draw-box").addEventListener("click", () => startDraw("box", (box) => {
+  customBounds = Object.fromEntries(Object.entries(box).map(([key, value]) => [key, Number(value.toFixed(3))]));
+  fillForm($("bounds"), customBounds);
+  applyArea();
+}));
+$("draw-polygon").addEventListener("click", drawPolygon);
+$("pick-point").addEventListener("click", () => startDraw("point", ({ lat, lon }) => {
+  fillForm($("circle"), { lat: lat.toFixed(4), lon: lon.toFixed(4) });
+  $("circle").requestSubmit();
+}));
+$("draw-cancel").addEventListener("click", endDraw);
+$("circle").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const { lat, lon, km } = Object.fromEntries([...new FormData(event.target)].map(([key, value]) => [key, Number(value)]));
+  circle = circleArea(lat, lon, km);
+  applyArea();
+});
+$("play").addEventListener("click", play);
 $("bounds").addEventListener("submit", (event) => {
   event.preventDefault();
   const data = Object.fromEntries([...new FormData(event.target)].map(([key, value]) => [key, Number(value)]));
@@ -1345,8 +2149,7 @@ $("bounds").addEventListener("submit", (event) => {
     return;
   }
   customBounds = data;
-  centerMaps();
-  loadSelection();
+  applyArea();
 });
 $("dataset").addEventListener("change", loadSelection);
 $("period-month").addEventListener("change", () => {
@@ -1370,6 +2173,7 @@ for (const type of ["pointerover", "focusin"]) {
   $("days").addEventListener(type, (event) => highlightWeek(mode === "week" ? event.target.dataset?.week : undefined));
 }
 for (const type of ["pointerleave", "focusout"]) $("days").addEventListener(type, () => highlightWeek());
+document.querySelectorAll("#map-layers button").forEach((button) => button.addEventListener("click", () => setMapMode(button.dataset.layer)));
 $("view-globe").addEventListener("click", () => showLocalMap(false));
 $("view-flat").addEventListener("click", () => showLocalMap(true));
 $("style-dark").addEventListener("click", () => selectBasemap(false));
@@ -1378,6 +2182,28 @@ $("zoom-in").addEventListener("click", () => activeGlobe().changeZoom(1.35));
 $("zoom-out").addEventListener("click", () => activeGlobe().changeZoom(1 / 1.35));
 $("recenter").addEventListener("click", centerMaps);
 $("history-form").addEventListener("submit", (event) => { event.preventDefault(); loadHistory(); });
+$("download-history-points").addEventListener("click", downloadHistoryPoints);
+$("history-report").addEventListener("click", () => {
+  $("history-export-note").hidden = false;
+  downloadReport($("history-export-note"));
+});
+$("download-report").addEventListener("click", () => downloadReport($("export-report-note")));
+$("copy-link").addEventListener("click", async () => {
+  const link = location.origin + location.pathname + linkState();
+  try {
+    await navigator.clipboard.writeText(link);
+    $("copy-link-note").textContent = "Link copied.";
+  } catch {
+    $("copy-link-note").textContent = link;
+  }
+});
+$("history-baseline").addEventListener("change", () => {
+  historyBaseline = $("history-baseline").value;
+  rerenderHistory();
+  syncLink();
+});
+document.querySelectorAll(".history-view button").forEach((button) =>
+  button.addEventListener("click", () => setHistoryView(button.dataset.historyView)));
 $("download-calendar").addEventListener("click", () =>
   csvDownload(exportName("calendar", selectionSlug()) + ".csv", calendarRows()));
 $("download-points").addEventListener("click", downloadPoints);
@@ -1394,16 +2220,19 @@ $("download-map").addEventListener("click", downloadMap);
 document.querySelectorAll(".history-shade button").forEach((button) => button.addEventListener("click", () => {
   historyShade = button.dataset.shade;
   document.querySelectorAll(".history-shade button").forEach((item) => item.setAttribute("aria-pressed", item === button));
-  const from = $("history-start").value;
-  const to = $("history-end").value;
-  if (historyRows.length || from) renderHistory($("history-table"), historyRows, from, to, Number(from.slice(0, 4)), Number(to.slice(0, 4)));
+  rerenderHistory();
+  syncLink();
 }));
 // The two top menus close each other, on Escape and on a click elsewhere.
 const menus = [document.querySelector(".location .filters:not(.export-menu)"), $("export-menu")];
 for (const menu of menus) {
   menu.addEventListener("toggle", () => {
     if (menu.open) menus.filter((other) => other !== menu).forEach((other) => { other.open = false; });
-    if (menu === $("export-menu")) updateExports();
+    if (menu === $("export-menu")) {
+      updateExports();
+      $("copy-link-note").textContent = "A link that opens this area, date and view.";
+      $("export-report-note").textContent = "A printable page: fire history, charts, trend and method for this area.";
+    }
   });
 }
 document.addEventListener("pointerdown", (event) => {

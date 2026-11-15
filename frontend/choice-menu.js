@@ -1,4 +1,4 @@
-export function enhanceSelect(select, { fixedCaption = false, alignEnd = false, searchLabel } = {}) {
+export function enhanceSelect(select, { fixedCaption = false, alignEnd = false, searchLabel, searchMode = "numeric" } = {}) {
   if (typeof HTMLElement.prototype.showPopover !== "function") return;
   const label = select.labels[0];
   const caption = label.textContent;
@@ -37,7 +37,7 @@ export function enhanceSelect(select, { fixedCaption = false, alignEnd = false, 
     options.classList.add("choice-scroll-list");
     search = document.createElement("input");
     search.type = "search";
-    search.inputMode = "numeric";
+    search.inputMode = searchMode;
     search.className = "choice-search";
     search.placeholder = searchLabel;
     search.setAttribute("aria-label", searchLabel);
@@ -52,8 +52,8 @@ export function enhanceSelect(select, { fixedCaption = false, alignEnd = false, 
   const items = () => Array.from(options.querySelectorAll("button:not(:disabled):not([hidden])"));
 
   function filterOptions() {
-    const query = search.value.trim();
-    for (const item of options.children) item.hidden = !item.textContent.includes(query);
+    const query = search.value.trim().toLowerCase();
+    for (const item of options.children) item.hidden = !item.textContent.toLowerCase().includes(query);
     options.scrollTop = 0;
     position();
   }
@@ -180,6 +180,8 @@ export function enhanceSelect(select, { fixedCaption = false, alignEnd = false, 
     if (!event.currentTarget.open && isOpen()) menu.hidePopover();
   });
   select.addEventListener("change", render);
+  // Lets code that sets the value directly update the caption without announcing a change.
+  select.addEventListener("refresh", render);
   new MutationObserver(() => {
     render();
     if (isOpen()) {

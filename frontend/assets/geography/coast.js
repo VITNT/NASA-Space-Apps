@@ -1,4 +1,3 @@
-// From Project SHIFT (Apache 2.0). See SHIFT-LICENSE.txt.
 // Coastlines as lines, made from the same land shapes as the land fill, so they line up exactly.
 // Before 12 Nov 2026 the coastline was the outline of the land polygons. On the 3D globe MapLibre
 // also drew the edges where those polygons are cut into tiles near the pole (faint rings at about

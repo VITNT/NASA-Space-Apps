@@ -309,7 +309,7 @@ details[open] > summary > .chevron,
 }
 .basemap-options { display: flex; flex-wrap: wrap; justify-content: end; gap: 4px; }
 .basemap-options + .basemap-options { margin-top: 4px; }
-:is(.basemap-controls, .flight-dock) button {
+:is(.basemap-controls, .flight-dock, .flight-satellites) button {
   padding: 0 12px;
   border: 1px solid var(--line);
   border-radius: 18px;
@@ -317,6 +317,8 @@ details[open] > summary > .chevron,
   font-size: 12px;
 }
 .basemap-controls button[aria-pressed="true"] { border-color: #bcd0ff; background: #353c4c; }
+:is(.flight-dock, .flight-satellites) button[aria-pressed="true"] { border-color: #bcd0ff; background: #353c4c; }
+:is(.flight-dock, .flight-satellites) button:disabled { opacity: .45; cursor: not-allowed; }
 .basemap-controls p { margin-top: 5px; font-size: 11px; color: var(--warm); }
 .basemap-controls p:empty { display: none; }
 .maplibre-active .scene-dock { padding-bottom: 30px; }
@@ -578,6 +580,28 @@ details[open] > summary > .chevron,
 .flight-telemetry dt { color: var(--muted); font-size: 11px; }
 .flight-telemetry dd { font-variant-numeric: tabular-nums; }
 #flight-selection, #flight-detection { margin-top: 7px; color: var(--text); }
+.flight-readout { max-width: min(380px, calc(100% - 2 * var(--edge))); }
+.flight-satellites { justify-content: start; margin-top: 10px; pointer-events: auto; }
+.flight-satellites button { min-height: 32px; }
+.flight-spec-card {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #0b0f17c7;
+  text-shadow: none;
+}
+.flight-spec {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  margin: 0;
+  font-size: 12px;
+}
+.flight-spec div { display: contents; }
+.flight-spec dt { color: var(--muted); }
+.flight-spec dd { margin: 0; font-variant-numeric: tabular-nums; }
+.flight-readout .flight-spec-note { margin-top: 8px; line-height: 1.4; }
 
 .flight-target {
   pointer-events: none;
@@ -612,7 +636,7 @@ details[open] > summary > .chevron,
   transform-style: preserve-3d;
   transform: rotateZ(var(--flight-bank)) rotateX(35deg) rotateY(-11deg);
 }
-#flight-terra {
+#flight-model {
   position: absolute;
   width: 100%;
   height: auto;
@@ -705,7 +729,9 @@ details[open] > summary > .chevron,
   .flight-readout { top: 65px; }
   .flight-readout h2 { font-size: 16px; }
   .flight-telemetry { margin-top: 6px; }
-  .flight-inspector { top: 146px; left: var(--edge); right: auto; text-align: left; }
+  .flight-inspector { top: 196px; left: var(--edge); right: auto; text-align: left; }
+  /* The picker stays; the full instrument sheet needs a wider screen. */
+  .flight-spec-card { display: none; }
   .flight-craft { transform: translate(calc(-50% + var(--flight-shift)), -50%) scale(.7); top: 64%; }
   .flight-dock { gap: 7px; }
   .flight-guide { width: 100%; }
@@ -715,4 +741,128 @@ details[open] > summary > .chevron,
   body:has(.flight:not([hidden])) .topbar nav :is(button, a) { padding: 0 6px; }
   .topbar nav { gap: 0; }
   .topbar nav :is(button, a) { padding: 0 5px; }
+}
+
+/* Area forms in the Area & data menu: point and radius, drawn outline, country. */
+#bounds #draw-box, .area-form button, .area-form .wide { grid-column: 1 / -1; }
+.area-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+.area-form input { display: block; width: 100%; margin-top: 4px; }
+.area-form button + button, #bounds #draw-box + button { margin-top: -2px; }
+#country-field { display: grid; gap: 6px; margin-bottom: 8px; }
+.area-hint { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.area-hint:empty { display: none; }
+#area-note { color: var(--warm); }
+.draw-hint { max-width: 30ch; color: var(--warm); pointer-events: auto; }
+.draw-hint button { min-height: 0; color: var(--text); font-size: inherit; text-decoration: underline; }
+
+/* "?" beside a number opens a card that explains it. */
+.help {
+  width: 16px;
+  min-height: 16px;
+  margin-left: 4px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 14px;
+  vertical-align: 2px;
+  pointer-events: auto;
+}
+.help:hover { color: var(--text); background: #ffffff14; }
+.help-card {
+  width: min(430px, calc(100vw - 2 * var(--edge)));
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  color: var(--text);
+  background: #1c1d21;
+  box-shadow: 0 15px 40px #0008;
+  white-space: normal;
+}
+.help-card::backdrop { background: #08090c99; }
+.help-card h3 { margin: 0 0 10px; font-size: 15px; font-weight: 560; }
+.help-card p { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.help-card p + p { margin-top: 8px; }
+.help-card strong { color: var(--text); font-weight: 560; }
+
+/* Play steps the calendar through the month a day at a time. */
+.play { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 0 9px; border-radius: 14px; color: var(--muted); font-size: 11px; pointer-events: auto; }
+.play:hover:enabled, .play[aria-pressed="true"] { color: var(--text); background: #ffffff14; }
+.play-icon { width: 8px; height: 9px; background: currentColor; clip-path: polygon(0 0, 100% 50%, 0 100%); }
+.play[aria-pressed="true"] .play-icon { clip-path: polygon(0 0, 35% 0, 35% 100%, 0 100%, 0 0, 65% 0, 100% 0, 100% 100%, 65% 100%, 65% 0); }
+.playing .days button[aria-pressed="true"] { background: #ffffff1f; }
+
+/* History: view switch, baseline, year totals, typical month, graphs. */
+.history-baseline { display: flex; align-items: center; gap: 6px; }
+.history-baseline .choice-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: 14px;
+  background: #ffffff0d;
+  font-size: 11px;
+}
+.history-baseline .choice-trigger:hover, .history-baseline .choice-trigger[aria-expanded="true"] { background: #ffffff16; }
+.history[data-view="graphs"] :is(.history-shade, .history-key .legend, .coverage-key) { display: none; }
+.history-summary { cursor: default; }
+.history-summary[data-level="plain"] { color: var(--muted); }
+.history-summary[data-partial] { opacity: .6; }
+.history-summary:hover { filter: none; }
+.history td:last-child, .history th:last-child { padding-left: 8px; }
+.history tfoot th, .history tfoot td { padding-top: 8px; }
+.history-graphs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 30px 34px; margin-top: 8px; }
+.chart { position: relative; margin: 0; }
+.chart figcaption { margin-bottom: 8px; }
+.chart figcaption strong { display: block; font-size: 14px; font-weight: 540; }
+.chart figcaption span { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 7px 0 0; padding: 0; list-style: none; color: var(--muted); font-size: 11px; }
+.chart-legend li { display: flex; align-items: center; gap: 5px; }
+.chart-legend i { width: 14px; height: 3px; border-radius: 2px; }
+.chart-tip {
+  position: absolute;
+  z-index: 1;
+  display: grid;
+  gap: 2px;
+  width: max-content;
+  max-width: 250px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 10px 30px #0007;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.chart-tip strong { font-weight: 560; }
+.chart-tip span { color: var(--muted); }
+.history p.chart-footnote { grid-column: 1 / -1; margin: 0; }
+#history-form { align-items: end; }
+
+/* Map analysis layers: a short reading of the layer under the area name. */
+.layer-panel { max-width: min(330px, calc(100vw - 2 * var(--edge))); margin-top: 12px; pointer-events: auto; }
+.layer-title { font-size: 13px; }
+.layer-title strong { font-weight: 560; }
+.layer-summary p { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.layer-summary p:first-child { color: var(--text); }
+.layer-legend { margin-top: 9px; font-size: 11px; gap: 4px 9px; }
+.layer-legend li::before { width: 14px; height: 10px; }
+.maplibre-active .layer-panel, .google-active .layer-panel { text-shadow: 0 1px 3px #08090c, 0 0 10px #08090c; }
+
+/* History: months far from the same month in other years. */
+.history p.history-unusual { font-size: 13px; }
+.history-unusual .link-button {
+  min-height: 0;
+  padding: 0;
+  color: var(--warm);
+  font-size: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.history-unusual .separator { color: var(--muted); }
+.history-cell[data-unusual] { box-shadow: inset 0 0 0 2px var(--text); }
+.history-cell[data-unusual="low"] { box-shadow: inset 0 0 0 2px #7fb6e8; }
+@media (max-width: 700px) {
+  .layer-panel { max-width: 62vw; }
 }

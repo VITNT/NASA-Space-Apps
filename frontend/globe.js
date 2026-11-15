@@ -40,6 +40,8 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
   let pointVectors = new Float64Array(0);
   let pointScreen = new Float32Array(0);
   let selectedPoint = -1;
+  // Flight only: the instrument swath under the spacecraft.
+  let swath;
   // Canvas pixels per CSS pixel.
   let unit = 1;
   let frame;
@@ -272,21 +274,97 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
         || projected.every(({ y }) => centerY - radius * y > height)) continue;
       ctx.fillStyle = cell.color;
       ctx.beginPath();
-      let previous = projected.at(-1);
-      for (const point of projected) {
-        if ((previous.depth > 0) !== (point.depth > 0)) {
-          const fraction = previous.depth / (previous.depth - point.depth);
-          const x = previous.x + fraction * (point.x - previous.x);
-          const y = previous.y + fraction * (point.y - previous.y);
-          const limb = radius / Math.hypot(x, y);
-          ctx.lineTo(centerX + limb * x, centerY - limb * y);
-        }
-        if (point.depth > 0) ctx.lineTo(centerX + radius * point.x, centerY - radius * point.y);
-        previous = point;
-      }
-      ctx.closePath();
+      tracePolygon(projected, centerX, centerY, radius);
       ctx.fill();
     }
+  }
+
+  // The band an instrument images on one pass: `halfWidth` degrees of arc to
+  // each side of the great circle through the spacecraft along `heading`.
+  function drawSwath(centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing) {
+    const sinLon = Math.sin(longitude * radians);
+    const cosLon = Math.cos(longitude * radians);
+    const p = spherePoint(swath.lat, swath.lon);
+    const lat = swath.lat * radians;
+    const lon = swath.lon * radians;
+    const heading = swath.heading * radians;
+    // Unit vectors toward north and east at the spacecraft, then along the track.
+    const north = [-Math.sin(lat) * Math.sin(lon), -Math.sin(lat) * Math.cos(lon), Math.cos(lat)];
+    const east = [Math.cos(lon), -Math.sin(lon), 0];
+    const start = [p.east, p.north, p.up];
+    const along = north.map((n, i) => n * Math.cos(heading) + east[i] * Math.sin(heading));
+    const side = [
+      start[1] * along[2] - start[2] * along[1],
+      start[2] * along[0] - start[0] * along[2],
+      start[0] * along[1] - start[1] * along[0],
+    ];
+    function screen(offset, t) {
+      const c = Math.cos(t);
+      const s = Math.sin(t);
+      const cw = Math.cos(offset);
+      const sw = Math.sin(offset);
+      const [x, y, z] = start.map((v, i) => (v * c + along[i] * s) * cw + side[i] * sw);
+      const forward = y * cosLon + x * sinLon;
+      const across = x * cosLon - y * sinLon;
+      const above = z * cosLat - forward * sinLat;
+      return {
+        x: across * cosBearing - above * sinBearing,
+        y: across * sinBearing + above * cosBearing,
+        depth: z * sinLat + forward * cosLat,
+      };
+    }
+    const reach = 70 * radians;
+    const steps = 48;
+    const edge = (offset) => Array.from({ length: steps + 1 }, (_, i) => screen(offset, -reach + 2 * reach * i / steps));
+    const left = edge(-swath.halfWidth * radians);
+    const right = edge(swath.halfWidth * radians);
+    // Fill the band, cutting it at the limb as the cells are.
+    ctx.beginPath();
+    tracePolygon([...left, ...[...right].reverse()], centerX, centerY, radius);
+    ctx.fillStyle = "#8fd8ff24";
+    ctx.fill();
+    ctx.lineWidth = 1.5 * unit;
+    ctx.strokeStyle = "#b4e6ffc0";
+    for (const line of [left, right]) strokeVisible(line, centerX, centerY, radius);
+    ctx.setLineDash([5 * unit, 6 * unit]);
+    ctx.strokeStyle = "#a8e1ff66";
+    strokeVisible(edge(0), centerX, centerY, radius);
+    ctx.setLineDash([]);
+  }
+
+  function strokeVisible(line, centerX, centerY, radius) {
+    ctx.beginPath();
+    let drawing = false;
+    for (const point of line) {
+      if (point.depth <= 0) {
+        drawing = false;
+        continue;
+      }
+      const x = centerX + radius * point.x;
+      const y = centerY - radius * point.y;
+      if (drawing) ctx.lineTo(x, y);
+      else ctx.moveTo(x, y);
+      drawing = true;
+    }
+    ctx.stroke();
+  }
+
+  // Adds a projected outline to the current path, following the limb where it
+  // passes behind the Earth.
+  function tracePolygon(projected, centerX, centerY, radius) {
+    let previous = projected.at(-1);
+    for (const point of projected) {
+      if ((previous.depth > 0) !== (point.depth > 0)) {
+        const fraction = previous.depth / (previous.depth - point.depth);
+        const x = previous.x + fraction * (point.x - previous.x);
+        const y = previous.y + fraction * (point.y - previous.y);
+        const limb = radius / Math.hypot(x, y);
+        ctx.lineTo(centerX + limb * x, centerY - limb * y);
+      }
+      if (point.depth > 0) ctx.lineTo(centerX + radius * point.x, centerY - radius * point.y);
+      previous = point;
+    }
+    ctx.closePath();
   }
 
   function cellAt(clientX, clientY) {
@@ -368,6 +446,7 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
       }
       ctx.putImageData(base, 0, 0);
     }
+    if (swath && !flat) drawSwath(centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing);
     if (cells.length) {
       if (flat) drawFlatCells(width, height, centerX, centerY, worldWidth);
       else drawGlobeCells(width, height, centerX, centerY, radius, sinLat, cosLat, sinBearing, cosBearing);
@@ -419,6 +498,11 @@ export function createGlobe(canvas, onSelect, onMove, onViewportChange, { pilot 
         const radius = globeRadius(width, height) * scale;
         if (!radius) return 0;
         return Math.asin(clamp((offsetY - height * globeCenterY) / radius, -.9, .9)) * degrees;
+      },
+      // { lat, lon, heading, halfWidth } in degrees, or null for none. Drawn on
+      // the next setCamera.
+      setSwath(next) {
+        swath = next;
       },
       setCells,
       getViewport,

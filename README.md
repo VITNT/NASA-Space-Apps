@@ -27,6 +27,74 @@ snapshot for a replacement archive, run
 `.venv/bin/python -m tools.build_global_history` and restart the server.
 The app can export the calendar and individual hotspot rows as CSV and the map as PNG.
 
+### Choosing an area
+
+**Area & data** offers five kinds of area:
+
+- a preset region;
+- **Custom coordinates**: type the four bounds, or choose **Draw on map** and drag a rectangle;
+- **Point and radius**: type a point and a radius in kilometres, or pick the point on the map;
+- **Drawn outline**: click each corner on the map, then click the first corner again or press Enter;
+- **Country**: search the list. Borders are Natural Earth's.
+
+Circles and drawn outlines are tested exactly, detection by detection. A country
+is tested on the calendar's own 0.1° grid: a detection belongs to it when the
+centre of its cell lies inside the border. Drawing needs the dark or NASA
+satellite map. The selected area is outlined on the map.
+
+### Timeline playback
+
+**Play** above the calendar steps through the month one day at a time and shows
+each day's detections on the map. It waits for a day to load before moving on,
+and skips days no satellite observed.
+
+### How detections are drawn
+
+Zoomed out, activity is grouped into dots. Closer in, every detection is drawn
+at its reported position. From about zoom 10 each detection is drawn as the
+sensor pixel that reported it, at its true size on the ground, because a
+detection locates a fire only to within its pixel: 375 m across for VIIRS at
+nadir and 1 km for MODIS, growing toward the swath edge. The pixel size comes
+from the `scan` and `track` fields FIRMS reports. Its orientation is estimated
+from each satellite's nominal orbit, since FIRMS does not report the track.
+
+### Comparing with the past
+
+The comparison under the month total sets it against the median of the same
+calendar month in up to five earlier years. A month still in progress is
+compared over the same days of the month. Without sensor calibration the
+earlier years are counted with only the satellites flying this month, so the
+comparison stays like for like after a satellite joins or retires.
+
+History has two views. **Calendar** is the year-by-month grid, with a total for
+each year and a row of medians for each calendar month. **Graphs** shows
+activity by year, the seasonal cycle, each month's difference from its
+baseline, and fire radiative power per satellite record. The **Baseline** menu
+switches between the median or mean of five earlier years, all earlier years,
+or the whole range. Cell tooltips and the History CSV add each month's rank
+and z-score.
+
+### Downloads and links
+
+- **Hotspots CSV** (Explore): every detection in the search.
+- **Hotspots CSV** (History): every detection in the History range, up to 500,000 rows.
+- **Calendar CSV** and **History CSV**: daily and monthly totals with coverage.
+- **Area report**: one HTML page with the area's totals, charts, burning
+  calendar, map, trend and method. Print it to save a PDF.
+- **Copy link**: the address bar always holds a link to the current area, date
+  and view, for example `#area=country:Cambodia&month=2025-02&view=history`.
+
+### Sensor calibration
+
+Harmonized (adjusted) counts, the trend test and comparisons across satellite
+eras need the calibration to have been run once for the archive:
+
+```sh
+.venv/bin/python -m firms_pipeline --root "$PWD/.local/archive" calibrate --threads 4
+```
+
+Restart the server afterwards. `/health` reports `calibration_available`.
+
 Luminite opens with a dark basemap in MapLibre GL JS. It uses Natural Earth
 land shapes via world-atlas 2.0.2, Natural Earth international borders and
 country labels, and provincial and district data prepared from Natural Earth
@@ -37,6 +105,15 @@ Choose **NASA satellite** for NASA GIBS Blue Marble imagery with the same fire c
 borders, and place labels. Both styles support the globe and 2D map. If MapLibre
 or the dark basemap cannot load, Luminite uses its bundled Blue Marble map.
 Pinch or scroll with two fingers to zoom, or use the on-screen zoom buttons.
+
+**Take orbit** flies over the same activity. Pick Terra, Aqua, Suomi NPP or
+NOAA-20 to show only that satellite's detections, its instrument and orbit
+(fire product, nominal equator-crossing times, swath, pixel growth across the
+scan, and the span it covers in this archive) and its swath at true width.
+**Follow orbit** holds the craft to the satellite's ground track, computed from
+its sun-synchronous inclination and the Earth's rotation, and switches between
+the day and night passes at the track's highest latitude. Orbit figures are
+nominal: Terra and Aqua no longer hold their original crossing times.
 
 ### Optional Google 3D satellite basemap
 
@@ -258,6 +335,16 @@ The service provides:
 - `GET /v1/summary/bbox`
 - `GET /v1/spatial/grid`
 - `GET /v1/spatial/monthly`
+- `GET /v1/areas/countries`
+- `GET /v1/export/hotspots/count` and `GET /v1/export/hotspots.csv`
+
+The calendar, map and export endpoints take a bounding box and, optionally, one
+shape inside it: `circle=lat,lon,radius_km`, `polygon=lat,lon,lat,lon,…` (up to
+120 corners) or `country=<name from /v1/areas/countries>`. The calendar also
+takes `through_day=N` to count only days 1 to N of each month, and repeated
+`platforms=` values to count only those satellites. Calendar rows include
+`modis_frp_mw`, `viirs_snpp_frp_mw` and `viirs_noaa20_frp_mw`: the fire
+radiative power of the detections counted, per satellite record.
 
 Point queries require a dataset, date range, and bounding box. They are limited
 to 31 days and 5,000 returned observations. Bounding boxes that cross the

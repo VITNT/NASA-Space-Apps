@@ -4,8 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Explore satellite-observed burning activity from NASA FIRMS.">
-  <title>FIRMS Fire Activity Explorer · Luminite</title>
-  <link rel="stylesheet" href="/static/styles.css?v=ramps">
+  <title>Luminite</title>
+  <link rel="icon" type="image/png" sizes="48x48" href="/static/assets/favicon.png">
+  <link rel="stylesheet" href="/static/styles.css?v=insights">
 </head>
 <body>
   <header class="topbar">
@@ -36,14 +37,33 @@
               <option value="global">Global</option><option value="cambodia">Cambodia</option>
               <option value="seasia">Southeast Asia</option><option value="amazon">Amazon basin</option>
               <option value="africa">Central and southern Africa</option><option value="custom">Custom coordinates</option>
+              <option value="circle">Point and radius</option><option value="polygon">Drawn outline</option>
+              <option value="country">Country</option>
             </select>
             <form id="bounds" hidden>
               <label>South<input name="min_lat" type="number" step="any" min="-90" max="90" required value="10"></label>
               <label>North<input name="max_lat" type="number" step="any" min="-90" max="90" required value="15"></label>
               <label>West<input name="min_lon" type="number" step="any" min="-180" max="180" required value="102"></label>
               <label>East<input name="max_lon" type="number" step="any" min="-180" max="180" required value="108"></label>
+              <button type="button" id="draw-box" title="Drag a rectangle on the map">Draw on map</button>
               <button>Apply bounds</button>
             </form>
+            <form id="circle" class="area-form" hidden>
+              <label>Latitude<input name="lat" type="number" step="any" min="-90" max="90" required value="12.5"></label>
+              <label>Longitude<input name="lon" type="number" step="any" min="-180" max="180" required value="105"></label>
+              <label class="wide">Radius (km)<input name="km" type="number" step="any" min="1" max="2000" required value="50"></label>
+              <button type="button" id="pick-point" title="Click the centre on the map">Pick on map</button>
+              <button>Apply</button>
+            </form>
+            <div id="polygon" class="area-form" hidden>
+              <p class="area-hint wide" id="polygon-note">Click each corner on the map. Click the first corner again, or press Enter, to finish.</p>
+              <button type="button" class="wide" id="draw-polygon">Draw on map</button>
+            </div>
+            <div id="country-field" hidden>
+              <label for="country">Country</label>
+              <select id="country"></select>
+            </div>
+            <p class="area-hint" id="area-note" role="status"></p>
             <label for="dataset">Satellite record</label>
             <select id="dataset"><option value="">Combined activity index</option></select>
           </div>
@@ -64,26 +84,57 @@
               <strong>Map image</strong>
               <span id="export-map-note">PNG of the current map view.</span>
             </button>
+            <button type="button" class="export-option" id="download-report" aria-describedby="export-report-note">
+              <strong>Area report</strong>
+              <span id="export-report-note">A printable page: fire history, charts, trend and method for this area.</span>
+            </button>
+            <button type="button" class="export-option" id="copy-link" aria-describedby="copy-link-note">
+              <strong>Copy link</strong>
+              <span id="copy-link-note">A link that opens this area, date and view.</span>
+            </button>
             <p class="export-footnote">Monthly history for this area is in <button type="button" class="link-button" data-view="history">History</button>.</p>
           </div>
         </details>
         </div>
         <h2 id="area-name">Global</h2>
         <p class="status" id="api-status" role="status">Connecting</p>
+        <div class="layer-panel" id="layer-panel" hidden>
+          <p class="layer-title"><strong>Anomalies</strong>
+            <button type="button" class="help" popovertarget="about-layer" aria-label="How this layer is made">?</button></p>
+          <div id="layer-summary" class="layer-summary" role="status"></div>
+          <ul class="legend layer-legend" id="layer-legend" aria-label="Layer colour key"></ul>
+        </div>
+        <div id="about-layer" class="help-card" popover>
+          <h3>Anomalies</h3>
+          <p><strong>What is shown.</strong> 1° regions whose activity this month is far from the same calendar month in the other years of the archive. Counts are adjusted for the satellites flying each year, so a new satellite does not look like a fire.</p>
+          <p><strong>The score.</strong> A robust z: the distance of log(1 + cell-days) from the median of the other years, in units of their median absolute deviation. Regions are shown from ±3, with at least 8 years to compare and 5 cell-days of activity. One extreme year does not hide another, and a doubling counts alike in quiet and busy places.</p>
+          <p><strong>Colours.</strong> The difference from the median, on the same scale as History: orange above, blue below.</p>
+          <p><strong>Limits.</strong> A month needs two satellites that observed every day of it, so the month in progress and the Terra-only months of 2000–2002 are not tested. Cloud and smoke hide fire, so a low month can also be a cloudy one.</p>
+        </div>
+        <p class="status draw-hint" id="draw-hint" role="status" hidden><span id="draw-hint-text"></span> <button type="button" id="draw-cancel">Cancel</button></p>
       </aside>
 
       <div class="scene-dock">
         <aside class="activity" aria-label="Selected month activity">
           <p id="map-attribution" class="map-attribution" hidden>
             <a href="https://www.naturalearthdata.com/" target="_blank" rel="noopener">Natural Earth</a> ·
-            <a href="https://www.geoboundaries.org/" target="_blank" rel="noopener">geoBoundaries</a><span id="nasa-attribution" hidden> · <a href="https://www.earthdata.nasa.gov/data/tools/gibs" target="_blank" rel="noopener">NASA GIBS</a></span>
+            <a href="https://www.geoboundaries.org/" target="_blank" rel="noopener">geoBoundaries</a> ·
+            <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a><span id="nasa-attribution" hidden> · <a href="https://www.earthdata.nasa.gov/data/tools/gibs" target="_blank" rel="noopener">NASA GIBS</a></span>
           </p>
           <details id="inspector" class="inspector">
             <summary id="selection-title">Month overview</summary>
             <dl id="selection-details" aria-live="polite"></dl>
           </details>
-          <p class="activity-value"><strong id="activity">—</strong> active cell-days</p>
-          <p class="comparison"><strong id="anomaly">—</strong> vs same-month median</p>
+          <p class="activity-value"><strong id="activity">—</strong> active cell-days
+            <button type="button" class="help" popovertarget="about-index" aria-label="What is an active cell-day?">?</button></p>
+          <div id="about-index" class="help-card" popover>
+            <h3>What the numbers mean</h3>
+            <p><strong>Active cell-day.</strong> The Earth is divided into cells 0.1° across, about 11 km. A cell counts once for each day a satellite saw fire in it, however many detections it held. So 300 cell-days can be 300 places burning for a day, or 10 places burning for a month.</p>
+            <p><strong>Why not count detections?</strong> VIIRS sees several times more hotspots than MODIS in the same fire, and the number of satellites has changed since 2000. Counting cells that burned, not pixels that fired, narrows that gap. Where the sensor calibration has been run, the rest is adjusted from the years the satellites overlap.</p>
+            <p><strong>Comparison.</strong> The percentage sets this month against the same calendar month in earlier years. For a month still in progress it compares the same days of the month, seen by the same satellites.</p>
+            <p><strong>What is left out.</strong> Low-confidence detections, and hotspots NASA classifies as volcanoes, gas flares, other static sources or offshore.</p>
+          </div>
+          <p class="comparison"><strong id="anomaly">—</strong> <span id="comparison-label">vs same-month median</span></p>
           <p class="coverage-label" id="coverage-label" data-state="none"></p>
           <p id="coverage-note" role="status">Checking archive coverage…</p>
         </aside>
@@ -92,6 +143,7 @@
           <header class="timeline-heading">
             <h2>Burning calendar <small>UTC</small></h2>
             <button type="button" id="whole-month" hidden>Whole month</button>
+            <button type="button" id="play" class="play" aria-pressed="false" title="Play the month day by day on the map" disabled><span class="play-icon" aria-hidden="true"></span><span id="play-label">Play</span></button>
             <div class="calendar-modes" role="group" aria-label="Select by">
               <button type="button" data-mode="day" aria-pressed="true" title="Select one day">Day</button>
               <button type="button" data-mode="week" aria-pressed="false" title="Select a Monday–Sunday week">Week</button>
@@ -134,6 +186,10 @@
           <button type="button" id="style-dark" aria-pressed="false" disabled>Dark</button>
           <button type="button" id="style-satellite" aria-pressed="true" disabled>NASA satellite</button>
         </div>
+        <div class="basemap-options" role="group" aria-label="Map layer" id="map-layers">
+          <button type="button" data-layer="detections" aria-pressed="true" title="Fire detections for the selected days">Detections</button>
+          <button type="button" id="layer-anomalies" data-layer="anomalies" aria-pressed="false" disabled title="1° regions far from their usual activity for this calendar month">Anomalies</button>
+        </div>
         <p id="basemap-status" role="status"></p>
       </div>
     </section>
@@ -143,17 +199,23 @@
 
       <aside class="location flight-readout">
         <h2 id="flight-title">Satellite flight</h2>
-        <p id="flight-model-credit" class="status" hidden>Terra model · <a href="https://science.nasa.gov/3d-resources/terra/" target="_blank" rel="noopener">NASA / Christian A. Lopez</a></p>
+        <p id="flight-model-credit" class="status" hidden></p>
+        <div id="flight-satellites" class="basemap-options flight-satellites" role="group" aria-label="Satellite"></div>
         <dl class="flight-telemetry">
           <div><dt>Position</dt><dd id="flight-position">—</dd></div>
           <div><dt>Heading</dt><dd id="flight-heading">—</dd></div>
-          <div><dt>Speed</dt><dd id="flight-speed" title="Percent of normal cruise speed">0%</dd></div>
+          <div><dt>Speed</dt><dd id="flight-speed" title="Percent of normal cruise speed; while following the orbit, also how many times faster than the real ground track">0%</dd></div>
+          <div id="flight-pass-row" hidden><dt>Pass</dt><dd id="flight-pass">—</dd></div>
         </dl>
+        <div id="flight-spec-card" class="flight-spec-card" hidden>
+          <dl id="flight-spec" class="flight-spec" aria-label="Satellite and instrument"></dl>
+          <p id="flight-spec-note" class="flight-spec-note"></p>
+        </div>
       </aside>
 
       <div class="flight-target" aria-hidden="true"></div>
       <div class="flight-craft" aria-hidden="true">
-        <canvas id="flight-terra" width="720" height="412" hidden></canvas>
+        <canvas id="flight-model" width="720" height="412" hidden></canvas>
         <div class="flight-craft-model">
           <div class="flight-wing flight-wing-left"></div>
           <div class="flight-wing flight-wing-right"></div>
@@ -178,6 +240,7 @@
         <div class="flight-guide">
           <p><kbd>W</kbd> Forward · <kbd>A</kbd><kbd>D</kbd> Steer · <kbd>S</kbd> Reverse · <kbd>Shift</kbd> Boost</p>
           <p>Scroll or <kbd>+</kbd><kbd>−</kbd> to zoom. Select a dot or cell to inspect it.</p>
+          <p>Pick a satellite to see only its detections and its swath at true width. Follow orbit keeps to its ground track.</p>
         </div>
         <div class="basemap-options flight-controls" aria-label="Flight controls">
           <button type="button" data-flight-control="left" aria-label="Turn left">←</button>
@@ -189,6 +252,8 @@
         <div class="basemap-options flight-actions" aria-label="Camera and flight view">
           <button type="button" id="flight-zoom-out" aria-label="Zoom out">−</button>
           <button type="button" id="flight-zoom-in" aria-label="Zoom in">+</button>
+          <button type="button" id="flight-swath" aria-pressed="true" disabled title="Show the instrument's swath, the band of Earth one pass images">Swath</button>
+          <button type="button" id="flight-orbit" aria-pressed="false" disabled title="Fly the satellite's real ground track: sun-synchronous inclination and the Earth's rotation">Follow orbit</button>
           <button type="button" id="flight-reset">Reset flight</button>
           <button type="button" id="flight-exit">Exit flight</button>
         </div>
@@ -203,22 +268,42 @@
           <label>To <input type="month" id="history-end" required></label>
           <button>Apply range</button>
           <button type="button" id="download-history" class="download-pill"><span class="download-icon" aria-hidden="true"></span>History CSV</button>
+          <button type="button" id="download-history-points" class="download-pill" title="Every detection in this area and range, one row each"><span class="download-icon" aria-hidden="true"></span>Hotspots CSV</button>
+          <button type="button" id="history-report" class="download-pill" title="A printable page with this history, its charts and the method"><span class="download-icon" aria-hidden="true"></span>Report</button>
         </form>
       </div>
       <p id="history-note" class="muted" role="status"></p>
       <p id="history-trend" class="history-trend" role="status" hidden></p>
+      <p id="history-unusual" class="history-trend history-unusual" hidden></p>
       <div class="history-key">
+        <div class="calendar-modes history-view" role="group" aria-label="Show history as">
+          <button type="button" data-history-view="calendar" aria-pressed="true">Calendar</button>
+          <button type="button" data-history-view="graphs" aria-pressed="false">Graphs</button>
+        </div>
         <div class="calendar-modes history-shade" role="group" aria-label="Shade months by">
           <button type="button" data-shade="activity" aria-pressed="true" title="Shade by active cell-days">Activity</button>
-          <button type="button" data-shade="anomaly" aria-pressed="false" title="Shade by difference from the median of up to five earlier years of the same month">vs median</button>
+          <button type="button" data-shade="anomaly" aria-pressed="false" title="Shade by difference from the baseline for the same calendar month">vs baseline</button>
+        </div>
+        <div class="history-baseline">
+          <label for="history-baseline">Baseline</label>
+          <select id="history-baseline">
+            <option value="median-5">Median of 5 earlier years</option>
+            <option value="mean-5">Mean of 5 earlier years</option>
+            <option value="median-all">Median of all earlier years</option>
+            <option value="mean-all">Mean of all earlier years</option>
+            <option value="median-range">Median of the whole range</option>
+            <option value="mean-range">Mean of the whole range</option>
+          </select>
         </div>
         <ul class="legend" id="history-legend" aria-label="Colour key"></ul>
         <p class="coverage-key"><span class="coverage-ticks" aria-hidden="true"><i data-state="full"></i><i data-state="partial"></i></span>
           Satellites, in order: <span id="history-ticks"></span>. Solid tick = whole month, hollow = part of it.</p>
       </div>
-      <div class="history-scroll"><table id="history-table"></table></div>
+      <p id="history-export-note" class="muted" role="status" hidden></p>
+      <div class="history-scroll" id="history-calendar"><table id="history-table"></table></div>
+      <div class="history-graphs" id="history-graphs" hidden></div>
     </section>
   </main>
-  <script type="module" src="/static/app.js?v=ramps"></script>
+  <script type="module" src="/static/app.js?v=insights"></script>
 </body>
 </html>

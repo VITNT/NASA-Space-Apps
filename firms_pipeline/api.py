@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
 import shlex
+import tempfile
+import threading
 from calendar import monthrange
 from contextlib import contextmanager
 from datetime import date
@@ -14,12 +17,14 @@ from pathlib import Path
 from typing import Annotated, Any, Iterator, Literal
 
 import duckdb
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import areas
+from .cache import ResponseCache
 from .pipeline import sql_string
 from .sensitivity import (
     CELL_DAY_FILTER,
@@ -30,6 +35,21 @@ from .sensitivity import (
     PLATFORM_BIT_SQL,
 )
 
+
+# DuckDB settings for every request. On a small VM set FIRMS_DUCKDB_MEMORY
+# (for example 600MB) so a large query spills to disk instead of failing.
+DUCKDB_CONFIG = {"threads": os.environ.get("FIRMS_DUCKDB_THREADS", "2")}
+if os.environ.get("FIRMS_DUCKDB_MEMORY"):
+    DUCKDB_CONFIG["memory_limit"] = os.environ["FIRMS_DUCKDB_MEMORY"]
+if os.environ.get("FIRMS_DUCKDB_TEMP"):
+    DUCKDB_CONFIG["temp_directory"] = os.environ["FIRMS_DUCKDB_TEMP"]
+# A region-month is flagged when its robust z reaches ANOMALY_Z: about one
+# month in a few hundred by chance for a well-behaved region.
+ANOMALY_Z = 3.0
+ANOMALY_MAD_FLOOR = 0.15   # in log units: no region is treated as steadier than ±15%
+ANOMALY_MIN_YEARS = 8
+ANOMALY_MIN_CELL_DAYS = 5
+QUERY_SLOTS = threading.BoundedSemaphore(max(1, int(os.environ.get("FIRMS_QUERY_SLOTS", "2"))))
 
 Dataset = Literal["modis", "viirs_noaa20", "viirs_snpp"]
 Platform = Literal["aqua", "terra", "noaa20", "snpp"]
@@ -45,6 +65,8 @@ MAP_POINT_COLUMNS = (
 )
 # The hotspot export is complete or refused, never cut short.
 EXPORT_LIMIT = 500_000
+# The longest period one hotspot export may cover: the whole archive.
+EXPORT_MAX_DAYS = 366 * 40
 # One row per detection, labelled for people as well as programs. Brightness
 # channels are named by spectral role because MODIS and VIIRS use different bands.
 EXPORT_FIELDS = (
@@ -150,6 +172,9 @@ class DataRepository:
                 and calibration_data.get("source_run_id") == self.point_manifest["run_id"]
             ):
                 self.calibration = calibration_data
+        # Cell-days per 1° region, month and platform mask, written by calibrate.
+        # With the factors it gives every region-month's adjusted activity.
+        self.masks_path = data_root / "merged" / "calibration" / "region_month_constellations.parquet"
         self.global_history = None
         if not self.calibration:
             try:
@@ -160,16 +185,22 @@ class DataRepository:
                 pass
 
     @contextmanager
-    def connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
-        connection = duckdb.connect()
-        connection.execute("SET threads = 2")
-        try:
-            yield connection
-        finally:
-            connection.close()
+    def connection(self, tables: dict[str, Any] | None = None) -> Iterator[duckdb.DuckDBPyConnection]:
+        # A small host runs out of memory long before it runs out of requests:
+        # only QUERY_SLOTS queries run at once, the rest wait their turn.
+        with QUERY_SLOTS:
+            connection = duckdb.connect(config=DUCKDB_CONFIG)
+            for name, table in (tables or {}).items():
+                connection.register(name, table)
+            try:
+                yield connection
+            finally:
+                connection.close()
 
-    def rows(self, query: str, parameters: list[Any] | None = None) -> list[dict[str, Any]]:
-        with self.connection() as connection:
+    def rows(
+        self, query: str, parameters: list[Any] | None = None, tables: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.connection(tables) as connection:
             cursor = connection.execute(query, parameters or [])
             names = [column[0] for column in cursor.description]
             return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
@@ -189,6 +220,10 @@ class DataRepository:
     @property
     def factors(self) -> str:
         return f"read_parquet({sql_string(self.factors_path)})"
+
+    @property
+    def anomalies_available(self) -> bool:
+        return self.calibration is not None and self.masks_path.exists()
 
     def harmonization_target(self, dataset: str | None) -> int | None:
         """The constellation that harmonized cell-days are expressed in."""
@@ -214,12 +249,25 @@ def _bbox_clause(min_lon: float, max_lon: float) -> tuple[str, list[float]]:
     return "(longitude >= ? OR longitude <= ?)", [min_lon, max_lon]
 
 
+def _area_shape(
+    circle: Annotated[str | None, Query(max_length=80, description="lat,lon,radius_km")] = None,
+    polygon: Annotated[str | None, Query(max_length=4000, description="lat,lon pairs of a drawn outline")] = None,
+    country: Annotated[str | None, Query(max_length=80, description="A name from /v1/areas/countries")] = None,
+) -> areas.Shape:
+    """An optional shape inside the bounding box: a circle, a drawn polygon or a country."""
+    return areas.shape(circle, polygon, country)
+
+
+AreaShape = Annotated[areas.Shape, Depends(_area_shape)]
+
+
 def _map_conditions(
     start_date: date, end_date: date,
     min_lat: float, max_lat: float, min_lon: float, max_lon: float,
     dataset: str | None, days: list[date] | None, viewport: list[float] | None,
+    platform: str | None = None,
 ) -> tuple[list[str], list[Any]]:
-    """The detections a map request covers: area, dates, sensor and viewport."""
+    """The detections a map request covers: area, dates, sensor, satellite and viewport."""
     longitude_sql, longitude_parameters = _bbox_clause(min_lon, max_lon)
     conditions = [
         "year BETWEEN ? AND ?", "acq_date BETWEEN ? AND ?",
@@ -232,6 +280,9 @@ def _map_conditions(
     if dataset is not None:
         conditions.append("dataset = ?")
         parameters.append(dataset)
+    if platform is not None:
+        conditions.append("platform = ?")
+        parameters.append(platform)
     if days:
         conditions.append("acq_date IN (SELECT unnest(?::DATE[]))")
         parameters.append(days)
@@ -295,6 +346,23 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         ),
     )
     app.add_middleware(GZipMiddleware, minimum_size=4096)
+    # Responses depend only on the URL, the published data and this code.
+    if os.environ.get("FIRMS_CACHE", "on").lower() not in {"0", "off", "false", "no"}:
+        code = hashlib.sha256(b"".join(
+            path.read_bytes() for path in sorted(Path(__file__).parent.glob("*.py"))
+        )).hexdigest()[:16]
+        version = "|".join(str(value) for value in (
+            code, repository.profile, repository.point_manifest["run_id"], repository.aggregate_manifest["run_id"],
+            (repository.calibration or {}).get("run_id"),
+        ))
+        cache_dir = os.environ.get("FIRMS_CACHE_DIR")
+        app.add_middleware(
+            ResponseCache, version=version,
+            # Never inside the data folder: the dataset stays exactly as published.
+            directory=Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "luminite-cache",
+            memory_bytes=int(os.environ.get("FIRMS_CACHE_MEMORY_MB", "48")) * 1024 * 1024,
+            disk_bytes=int(os.environ.get("FIRMS_CACHE_DISK_MB", "512")) * 1024 * 1024,
+        )
     app.state.repository = repository
     frontend_root = Path(__file__).resolve().parents[1] / "frontend"
     if frontend_root.exists():
@@ -330,6 +398,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             "area_label": repo.point_manifest.get("area_label"),
             "calibration_available": repo.calibration is not None,
             "global_history_available": repo.global_history is not None,
+            "anomalies_available": repo.anomalies_available,
         }
 
     @app.get("/v1/calibration")
@@ -342,6 +411,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 "Until then, months with different satellites are not comparable.",
             }
         return {"available": True, **repo.calibration}
+
+    @app.get("/v1/areas/countries", response_model=ResultPage)
+    def country_areas() -> ResultPage:
+        """Countries that can be used as an area, with the bounding box to query them with."""
+        data = areas.countries()
+        return ResultPage(data=data, count=len(data))
 
     @app.get("/v1/coverage", response_model=ResultPage)
     def coverage(request: Request) -> ResultPage:
@@ -394,15 +469,17 @@ def create_app(project_root: Path | None = None) -> FastAPI:
     def export_query(
         repo: DataRepository, start_date: date, end_date: date,
         min_lat: float, max_lat: float, min_lon: float, max_lon: float,
-        dataset: str | None, days: list[date] | None,
+        dataset: str | None, days: list[date] | None, platform: str | None = None,
+        shape: areas.Shape = areas.Shape(),
     ) -> tuple[str, list[Any]]:
-        _date_span(start_date, end_date, 31)
+        _date_span(start_date, end_date, EXPORT_MAX_DAYS)
         if max_lat < min_lat:
             raise HTTPException(status_code=422, detail="Invalid latitude bounds")
         if days and any(day < start_date or day > end_date for day in days):
             raise HTTPException(status_code=422, detail="Selected days must be within the date range")
         conditions, parameters = _map_conditions(
-            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, None)
+            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, None, platform)
+        conditions.extend(shape.conditions)
         return f"FROM {repo.points} WHERE {' AND '.join(conditions)}", parameters
 
     @app.get("/v1/export/hotspots/count")
@@ -415,12 +492,15 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         min_lon: Annotated[float, Query(ge=-180, le=180)],
         max_lon: Annotated[float, Query(ge=-180, le=180)],
         dataset: Dataset | None = None,
+        platform: Platform | None = None,
         days: Annotated[list[date] | None, Query(max_length=31)] = None,
+        shape: AreaShape = areas.Shape(),
     ) -> dict[str, Any]:
         repo = _repository(request)
-        source, parameters = export_query(repo, start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days)
+        source, parameters = export_query(
+            repo, start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, platform, shape)
         count, qualifying = repo.rows(
-            f"SELECT count(*) AS n, count_if({CELL_DAY_FILTER}) AS q {source}", parameters)[0].values()
+            f"SELECT count(*) AS n, count_if({CELL_DAY_FILTER}) AS q {source}", parameters, shape.tables)[0].values()
         return {"count": count, "qualifying": qualifying, "limit": EXPORT_LIMIT}
 
     @app.get("/v1/export/hotspots.csv")
@@ -433,7 +513,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         min_lon: Annotated[float, Query(ge=-180, le=180)],
         max_lon: Annotated[float, Query(ge=-180, le=180)],
         dataset: Dataset | None = None,
+        platform: Platform | None = None,
         days: Annotated[list[date] | None, Query(max_length=31)] = None,
+        shape: AreaShape = areas.Shape(),
     ) -> StreamingResponse:
         """Every detection in the search, one row each, streamed as CSV.
 
@@ -441,13 +523,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         larger than EXPORT_LIMIT is refused so the file is always complete.
         """
         repo = _repository(request)
-        source, parameters = export_query(repo, start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days)
-        count = repo.rows(f"SELECT count(*) AS n {source}", parameters)[0]["n"]
+        source, parameters = export_query(
+            repo, start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, platform, shape)
+        count = repo.rows(f"SELECT count(*) AS n {source}", parameters, shape.tables)[0]["n"]
         if count > EXPORT_LIMIT:
             raise HTTPException(
                 status_code=413,
                 detail=f"{count:,} detections exceed the {EXPORT_LIMIT:,}-row export limit. "
-                "Narrow the area or choose fewer days.",
+                "Narrow the area or choose a shorter period.",
             )
         query = f"SELECT {EXPORT_SQL} {source} ORDER BY observation_time_utc, dataset, platform, latitude, longitude"
 
@@ -455,7 +538,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
             buffer = io.StringIO()
             writer = csv.writer(buffer, lineterminator="\r\n")
             writer.writerow(EXPORT_COLUMNS)
-            with repo.connection() as connection:
+            with repo.connection(shape.tables) as connection:
                 cursor = connection.execute(query, parameters)
                 while batch := cursor.fetchmany(20_000):
                     writer.writerows(batch)
@@ -482,6 +565,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         dataset: Dataset | None = None,
         interval: Literal["day", "month"] = "day",
         month: Annotated[int | None, Query(ge=1, le=12)] = None,
+        through_day: Annotated[int | None, Query(ge=1, le=31, description="Count only days 1 to N of each month")] = None,
+        platforms: Annotated[list[Platform] | None, Query(description="Count only these satellites")] = None,
+        shape: AreaShape = areas.Shape(),
     ) -> ResultPage:
         if max_lat < min_lat:
             raise HTTPException(status_code=422, detail="Invalid latitude bounds")
@@ -489,6 +575,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         whole_months = start_date.day == 1 and end_date.day == monthrange(end_date.year, end_date.month)[1]
         if (
             repo.global_history is not None and interval == "month" and whole_months
+            and not shape and through_day is None and not platforms
             and (min_lat, max_lat, min_lon, max_lon) == (-90, 90, -180, 180)
         ):
             _date_span(start_date, end_date, 366 * 100)
@@ -509,6 +596,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if dataset is not None:
             conditions.append("dataset = ?")
             parameters.append(dataset)
+        if through_day is not None:
+            conditions.append("day(acq_date) <= ?")
+            parameters.append(through_day)
+        if platforms:
+            conditions.append("platform IN (SELECT unnest(?::VARCHAR[]))")
+            parameters.append(platforms)
+        conditions.extend(shape.conditions)
         if month is not None:
             conditions.append("month = ?")
             parameters.append(month)
@@ -530,7 +624,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     SELECT acq_date, {CELL_Y_SQL} AS y, {CELL_X_SQL} AS x,
                         count_if(dataset = 'modis') AS modis,
                         count_if(dataset = 'viirs_snpp') AS viirs_snpp,
-                        count_if(dataset = 'viirs_noaa20') AS viirs_noaa20
+                        count_if(dataset = 'viirs_noaa20') AS viirs_noaa20,
+                        sum(frp_mw) FILTER (dataset = 'modis') AS frp_modis,
+                        sum(frp_mw) FILTER (dataset = 'viirs_snpp') AS frp_snpp,
+                        sum(frp_mw) FILTER (dataset = 'viirs_noaa20') AS frp_noaa20
                     FROM {repo.points}
                     WHERE {' AND '.join(conditions)}
                     GROUP BY acq_date, y, x
@@ -541,9 +638,12 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     sum(viirs_snpp)::BIGINT AS viirs_snpp,
                     sum(viirs_noaa20)::BIGINT AS viirs_noaa20,
                     count_if(modis > 0 AND (viirs_snpp > 0 OR viirs_noaa20 > 0)) AS shared_cell_days,
-                    NULL::DOUBLE AS harmonized_cell_days
+                    NULL::DOUBLE AS harmonized_cell_days,
+                    round(coalesce(sum(frp_modis), 0)::DOUBLE, 1) AS modis_frp_mw,
+                    round(coalesce(sum(frp_snpp), 0)::DOUBLE, 1) AS viirs_snpp_frp_mw,
+                    round(coalesce(sum(frp_noaa20), 0)::DOUBLE, 1) AS viirs_noaa20_frp_mw
                 FROM cell_days GROUP BY 1 ORDER BY 1
-            """, parameters)
+            """, parameters, shape.tables)
             return ResultPage(data=data, count=len(data))
         else:
             factor = f"CASE WHEN r.source = {target} THEN 1 ELSE coalesce(f.factor, g.factor) END"
@@ -566,6 +666,9 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     count_if(dataset = 'modis') AS modis,
                     count_if(dataset = 'viirs_snpp') AS viirs_snpp,
                     count_if(dataset = 'viirs_noaa20') AS viirs_noaa20,
+                    sum(frp_mw) FILTER (dataset = 'modis') AS frp_modis,
+                    sum(frp_mw) FILTER (dataset = 'viirs_snpp') AS frp_snpp,
+                    sum(frp_mw) FILTER (dataset = 'viirs_noaa20') AS frp_noaa20,
                     bit_or({PLATFORM_BIT_SQL})::INTEGER AS mask
                 FROM {repo.points}
                 WHERE {' AND '.join(conditions)}
@@ -576,6 +679,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                     count(*) AS cell_days,
                     count_if((c.mask & v.source) != 0) AS usable,
                     sum(c.modis) AS modis, sum(c.viirs_snpp) AS viirs_snpp, sum(c.viirs_noaa20) AS viirs_noaa20,
+                    sum(c.frp_modis) AS frp_modis, sum(c.frp_snpp) AS frp_snpp, sum(c.frp_noaa20) AS frp_noaa20,
                     count_if(c.modis > 0 AND (c.viirs_snpp > 0 OR c.viirs_noaa20 > 0)) AS shared
                 FROM cell_days c
                 LEFT JOIN coverage v ON v.month_start = CAST(date_trunc('month', c.acq_date) AS DATE)
@@ -587,11 +691,14 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 sum(r.viirs_snpp)::BIGINT AS viirs_snpp,
                 sum(r.viirs_noaa20)::BIGINT AS viirs_noaa20,
                 sum(r.shared)::BIGINT AS shared_cell_days,
-                {harmonized} AS harmonized_cell_days
+                {harmonized} AS harmonized_cell_days,
+                round(coalesce(sum(r.frp_modis), 0)::DOUBLE, 1) AS modis_frp_mw,
+                round(coalesce(sum(r.frp_snpp), 0)::DOUBLE, 1) AS viirs_snpp_frp_mw,
+                round(coalesce(sum(r.frp_noaa20), 0)::DOUBLE, 1) AS viirs_noaa20_frp_mw
             FROM regional r{factor_joins}
             GROUP BY 1 ORDER BY 1
         """
-        data = repo.rows(query, parameters)
+        data = repo.rows(query, parameters, shape.tables)
         return ResultPage(data=data, count=len(data))
 
     @app.get("/v1/spatial/grid", response_model=MapGrid)
@@ -604,9 +711,11 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         min_lon: Annotated[float, Query(ge=-180, le=180)],
         max_lon: Annotated[float, Query(ge=-180, le=180)],
         dataset: Dataset | None = None,
+        platform: Platform | None = None,
         days: Annotated[list[date] | None, Query(max_length=31)] = None,
         cell_size: float | None = None,
         viewport: Annotated[list[float] | None, Query(min_length=4, max_length=4)] = None,
+        shape: AreaShape = areas.Shape(),
     ) -> MapGrid:
         _date_span(start_date, end_date, 31)
         if max_lat < min_lat:
@@ -631,7 +740,8 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         if viewport and any(bound % cell_size for bound in viewport):
             raise HTTPException(status_code=422, detail="Map viewport must align to grid cells")
         conditions, parameters = _map_conditions(
-            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, viewport)
+            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, viewport, platform)
+        conditions.extend(shape.conditions)
 
         data = repo.rows(f"""
             WITH observations AS (
@@ -648,7 +758,7 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 list(DISTINCT platform ORDER BY platform) AS platforms, sum(frp_mw)::DOUBLE AS frp_sum_mw
             FROM observations
             GROUP BY x, y ORDER BY y, x
-        """, parameters)
+        """, parameters, shape.tables)
         return MapGrid(data=data, cell_size=cell_size)
 
     @app.get("/v1/spatial/points")
@@ -661,8 +771,10 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         min_lon: Annotated[float, Query(ge=-180, le=180)],
         max_lon: Annotated[float, Query(ge=-180, le=180)],
         dataset: Dataset | None = None,
+        platform: Platform | None = None,
         days: Annotated[list[date] | None, Query(max_length=31)] = None,
         viewport: Annotated[list[float] | None, Query(min_length=4, max_length=4)] = None,
+        shape: AreaShape = areas.Shape(),
     ) -> JSONResponse:
         """Individual detections for the map, as rows of MAP_POINT_COLUMNS.
 
@@ -680,12 +792,13 @@ def create_app(project_root: Path | None = None) -> FastAPI:
                 raise HTTPException(status_code=422, detail="Invalid map viewport bounds")
         repo = _repository(request)
         conditions, parameters = _map_conditions(
-            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, viewport)
+            start_date, end_date, min_lat, max_lat, min_lon, max_lon, dataset, days, viewport, platform)
+        conditions.extend(shape.conditions)
         columns = ", ".join(
             "strftime(observation_time_utc, '%Y-%m-%dT%H:%M:%SZ')" if name == "observed_utc" else name
             for name in MAP_POINT_COLUMNS
         )
-        with repo.connection() as connection:
+        with repo.connection(shape.tables) as connection:
             rows = connection.execute(
                 f"SELECT {columns} FROM {repo.points} WHERE {' AND '.join(conditions)} LIMIT ?",
                 [*parameters, MAP_POINT_LIMIT + 1],
@@ -951,6 +1064,85 @@ def create_app(project_root: Path | None = None) -> FastAPI:
         truncated = len(data) > limit
         data = data[:limit]
         return ResultPage(data=data, count=len(data), truncated=truncated)
+
+    @app.get("/v1/anomalies")
+    def region_anomalies(
+        request: Request,
+        month: Annotated[str, Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="YYYY-MM")],
+        min_lat: Annotated[float, Query(ge=-90, le=90)] = -90,
+        max_lat: Annotated[float, Query(ge=-90, le=90)] = 90,
+        min_lon: Annotated[float, Query(ge=-180, le=180)] = -180,
+        max_lon: Annotated[float, Query(ge=-180, le=180)] = 180,
+    ) -> dict[str, Any]:
+        """1° regions whose adjusted activity this month is far from the same month in other years.
+
+        Read from the calibration's cell-days per region, month and platform mask,
+        adjusted exactly as /v1/calendar adjusts them. The score is a robust z:
+        the distance of log(1 + cell-days) from the median of the other years, in
+        units of their median absolute deviation. One extreme year does not hide
+        another, and a doubling counts alike in quiet and busy regions.
+        """
+        repo = _repository(request)
+        if not repo.anomalies_available:
+            raise HTTPException(status_code=404, detail="Anomalies need the sensor calibration. Run `python -m firms_pipeline calibrate`.")
+        year, calendar_month = int(month[:4]), int(month[5:])
+        target = repo.harmonization_target(None)
+        longitude = "k.rx + .5 BETWEEN ? AND ?" if min_lon <= max_lon else "(k.rx + .5 >= ? OR k.rx + .5 <= ?)"
+        data = repo.rows(f"""
+            WITH coverage AS (
+                SELECT year(month_start) AS year, bit_or({PLATFORM_BIT_SQL}) FILTER ({COMPLETE_PLATFORM_SQL})::INTEGER AS source
+                FROM {repo.monthly} WHERE month(month_start) = ? GROUP BY ALL
+            ),
+            -- A month counts when two or more satellites observed all of it. Terra
+            -- alone (2000-2002) needs a tenfold adjustment that was never validated.
+            years AS (SELECT year FROM coverage WHERE bit_count(source) >= 2),
+            adjusted AS (
+                SELECT k.year, k.ry, k.rx,
+                    sum(CASE WHEN (k.mask & c.source) = 0 THEN 0 WHEN c.source = {target} THEN k.cell_days
+                        ELSE k.cell_days * coalesce(f.factor, g.factor) END) AS value
+                FROM read_parquet({sql_string(repo.masks_path)}) k
+                JOIN coverage c ON c.year = k.year AND bit_count(c.source) >= 2
+                LEFT JOIN {repo.factors} f ON f.ry = k.ry AND f.rx = k.rx AND f.month = k.month
+                    AND f.target = {target} AND f.source = c.source
+                LEFT JOIN {repo.factors} g ON g.ry = {GLOBAL_REGION} AND g.month = k.month
+                    AND g.target = {target} AND g.source = c.source
+                WHERE k.month = ? AND k.ry + .5 BETWEEN ? AND ? AND {longitude}
+                GROUP BY ALL
+            ),
+            filled AS (
+                SELECT r.ry, r.rx, y.year, coalesce(a.value, 0) AS value
+                FROM (SELECT DISTINCT ry, rx FROM adjusted) r CROSS JOIN years y
+                LEFT JOIN adjusted a ON a.ry = r.ry AND a.rx = r.rx AND a.year = y.year
+            ),
+            baseline AS (
+                SELECT ry, rx, count(*) AS years, median(value) AS centre, median(ln(1 + value)) AS centre_log
+                FROM filled WHERE year != ? GROUP BY ry, rx
+            ),
+            spread AS (
+                SELECT o.ry, o.rx, median(abs(ln(1 + o.value) - b.centre_log)) AS mad
+                FROM filled o JOIN baseline b USING (ry, rx) WHERE o.year != ? GROUP BY o.ry, o.rx
+            ),
+            scored AS (
+                SELECT f.ry, f.rx, f.value, b.centre, b.years,
+                    (ln(1 + f.value) - b.centre_log) / greatest(1.4826 * s.mad, ?) AS z
+                FROM filled f JOIN baseline b USING (ry, rx) JOIN spread s USING (ry, rx)
+                WHERE f.year = ? AND b.years >= ? AND greatest(f.value, b.centre) >= ?
+            )
+            SELECT ry, rx, round(value, 1) AS value, round(centre, 1) AS baseline, years,
+                round(CASE WHEN centre > 0 THEN value / centre - 1 END, 3) AS delta, round(z, 2) AS z
+            FROM scored WHERE abs(z) >= ?
+            ORDER BY abs(z) DESC, ry, rx
+        """, [
+            calendar_month, calendar_month, min_lat, max_lat, min_lon, max_lon, year, year,
+            ANOMALY_MAD_FLOOR, year, ANOMALY_MIN_YEARS, ANOMALY_MIN_CELL_DAYS, ANOMALY_Z,
+        ])
+        observed = len(repo.rows(
+            f"SELECT platform FROM {repo.monthly} WHERE month_start = ? AND {COMPLETE_PLATFORM_SQL}",
+            [date(year, calendar_month, 1)])) >= 2
+        return {
+            "month": month, "available": observed, "threshold": ANOMALY_Z, "data": data if observed else [],
+            **({} if observed else {"reason": "Fewer than two satellites observed this month in full, so its adjusted values are not reliable enough to compare."}),
+        }
 
     return app
 

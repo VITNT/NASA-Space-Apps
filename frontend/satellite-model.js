@@ -38,7 +38,7 @@ function readMeshes(contents) {
   const jsonLength = header.getUint32(12, true);
   if (header.getUint32(0, true) !== 0x46546c67 || header.getUint32(4, true) !== 2 ||
       header.getUint32(16, true) !== 0x4e4f534a || header.getUint32(24 + jsonLength, true) !== 0x004e4942) {
-    throw new Error("Invalid Terra model");
+    throw new Error("Invalid spacecraft model");
   }
   const model = JSON.parse(new TextDecoder().decode(new Uint8Array(contents, 20, jsonLength)));
   const binaryOffset = 28 + jsonLength;
@@ -50,7 +50,10 @@ function readMeshes(contents) {
     const accessor = model.accessors[index];
     const view = model.bufferViews[accessor.bufferView];
     const ArrayType = types[accessor.componentType];
-    if (!ArrayType || view.byteStride) throw new Error("Unsupported Terra mesh layout");
+    // Interleaved buffers are not supported; a stride equal to one element is tightly packed.
+    if (!ArrayType || (view.byteStride && view.byteStride !== components * ArrayType.BYTES_PER_ELEMENT)) {
+      throw new Error("Unsupported spacecraft mesh layout");
+    }
     return new ArrayType(contents, binaryOffset + (view.byteOffset ?? 0) + (accessor.byteOffset ?? 0), accessor.count * components);
   }
 
@@ -90,12 +93,25 @@ function readMeshes(contents) {
   return parts;
 }
 
-export async function loadTerraModel(canvas) {
+// Fixed Euler turn (degrees about x, then y, then z) and size that put a model
+// in the same pose as Terra: solar array across the screen, nadir side down.
+function orient(parts, [x, y, z], scale) {
+  const [cx, sx, cy, sy, cz, sz] = [x, y, z].flatMap((angle) => [Math.cos(angle * Math.PI / 180), Math.sin(angle * Math.PI / 180)]);
+  for (const { vertices } of parts) {
+    for (let i = 0; i < vertices.length; i += 3) {
+      let [px, py, pz] = vertices.subarray(i, i + 3);
+      [py, pz] = [py * cx - pz * sx, py * sx + pz * cx];
+      [px, pz] = [px * cy + pz * sy, pz * cy - px * sy];
+      [px, py] = [px * cz - py * sz, px * sz + py * cz];
+      vertices.set([px * scale, py * scale, pz * scale], i);
+    }
+  }
+}
+
+// One WebGL view that can show any of the bundled spacecraft, loading each once.
+export function createSatelliteModel(canvas) {
   const gl = canvas.getContext("webgl2", { alpha: true, antialias: true });
   if (!gl) return null;
-  const response = await fetch("/static/assets/satellites/terra.glb");
-  if (!response.ok) throw new Error("Terra model unavailable");
-  const parts = readMeshes(await response.arrayBuffer());
   const program = gl.createProgram();
   for (const [type, source] of [[gl.VERTEX_SHADER, vertexShader], [gl.FRAGMENT_SHADER, fragmentShader]]) {
     const shader = compile(gl, type, source);
@@ -110,20 +126,43 @@ export async function loadTerraModel(canvas) {
   const angles = gl.getUniformLocation(program, "angles");
   const aspect = gl.getUniformLocation(program, "aspect");
   const material = gl.getUniformLocation(program, "material");
-  const meshes = parts.map(({ vertices, indices, color }) => {
-    const mesh = gl.createVertexArray();
-    gl.bindVertexArray(mesh);
-    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
-    gl.enableVertexAttribArray(position);
-    gl.vertexAttribPointer(position, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
-    return { mesh, length: indices.length, type: indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, color };
-  });
-
+  const loaded = new Map();
+  let meshes = [];
+  let current;
   let lastBank;
+
+  async function load({ url, rotation = [0, 0, 0], scale = 1 }) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Spacecraft model unavailable: ${url}`);
+    const parts = readMeshes(await response.arrayBuffer());
+    orient(parts, rotation, scale);
+    return parts.map(({ vertices, indices, color }) => {
+      const mesh = gl.createVertexArray();
+      gl.bindVertexArray(mesh);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(position);
+      gl.vertexAttribPointer(position, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+      return { mesh, length: indices.length, type: indices instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT, color };
+    });
+  }
+
   return {
+    // Resolves to false when a newer request replaced this one before it loaded.
+    async show(model) {
+      current = model.url;
+      if (!loaded.has(model.url)) loaded.set(model.url, load(model).catch((error) => {
+        loaded.delete(model.url);
+        throw error;
+      }));
+      const next = await loaded.get(model.url);
+      if (current !== model.url) return false;
+      meshes = next;
+      lastBank = undefined;
+      return true;
+    },
     draw(bank) {
       const angle = Math.round(bank * 10) / 10;
       if (angle === lastBank) return;
